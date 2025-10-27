@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.19
 # Multi-stage build for a small final image
 
 FROM rust:1.90 AS builder

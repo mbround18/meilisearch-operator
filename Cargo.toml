@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/meilisearch-operator"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+authors = ["Meili Operator Authors"]
+license = "Apache-2.0"

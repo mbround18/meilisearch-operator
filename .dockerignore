@@ -1,0 +1,7 @@
+target/
+charts/
+*.log
+*.tmp
+*.swp
+*.bak
+.env

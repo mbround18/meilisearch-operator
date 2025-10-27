@@ -1,0 +1,25 @@
+{{- range .Values.keys }}
+apiVersion: meili.operator.dev/v1alpha1
+kind: Key
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Values.namespace }}
+  annotations:
+    {{- toYaml $.Values.annotations | nindent 4 }}
+spec:
+  server_ref: {{ $.Values.server.name }}
+  {{- if .description }}
+  description: {{ .description | quote }}
+  {{- end }}
+  actions:
+  {{- range .actions }}
+    - {{ . | quote }}
+  {{- end }}
+  indexes:
+  {{- range .indexes }}
+    - {{ . | quote }}
+  {{- end }}
+  secret_namespace: {{ $.Values.namespace }}
+  secret_name: {{ .secretName }}
+---
+{{- end }}

@@ -1,0 +1,233 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: servers.meili.operator.dev
+spec:
+  group: meili.operator.dev
+  names:
+    categories: []
+    kind: Server
+    plural: servers
+    shortNames:
+    - msrv
+    singular: server
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ServerSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              image:
+                nullable: true
+                type: string
+              port:
+                default: 7700
+                description: Port for meilisearch HTTP, default 7700
+                format: uint16
+                maximum: 65535.0
+                minimum: 0.0
+                type: integer
+              replicas:
+                default: 1
+                format: int32
+                type: integer
+              service_type:
+                default: ClusterIP
+                description: 'Service type: ClusterIP, NodePort, LoadBalancer'
+                type: string
+              storage:
+                description: Storage size, e.g. "10Gi"
+                nullable: true
+                type: string
+            type: object
+          status:
+            nullable: true
+            properties:
+              endpoint:
+                nullable: true
+                type: string
+              message:
+                nullable: true
+                type: string
+              ready:
+                type: boolean
+            required:
+            - ready
+            type: object
+        required:
+        - spec
+        title: Server
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: indexes.meili.operator.dev
+spec:
+  group: meili.operator.dev
+  names:
+    categories: []
+    kind: Index
+    plural: indexes
+    shortNames:
+    - midx
+    singular: index
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for IndexSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              admin_key:
+                description: 'Optional: generate an admin key with actions ["*"] scoped to this index'
+                nullable: true
+                properties:
+                  create:
+                    default: false
+                    description: Create an admin key scoped to this index
+                    type: boolean
+                  secret_name:
+                    description: Name for the Secret (defaults to "<uid>-admin-key" if None)
+                    nullable: true
+                    type: string
+                  secret_namespace:
+                    description: Namespace to store the Secret (defaults to CR namespace if None)
+                    nullable: true
+                    type: string
+                type: object
+              delete_on_finalize:
+                default: false
+                description: If true, delete index on CR deletion
+                type: boolean
+              primary_key:
+                description: Optional primary key
+                nullable: true
+                type: string
+              server_ref:
+                description: Reference to Server name in same namespace
+                type: string
+              uid:
+                description: Index uid
+                type: string
+            required:
+            - server_ref
+            - uid
+            type: object
+          status:
+            nullable: true
+            properties:
+              message:
+                nullable: true
+                type: string
+              ready:
+                type: boolean
+            required:
+            - ready
+            type: object
+        required:
+        - spec
+        title: Index
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: keys.meili.operator.dev
+spec:
+  group: meili.operator.dev
+  names:
+    categories: []
+    kind: Key
+    plural: keys
+    shortNames:
+    - mkey
+    singular: key
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for KeySpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              actions:
+                description: Actions like ["search", "documents.add"]
+                items:
+                  type: string
+                type: array
+              description:
+                description: Description
+                nullable: true
+                type: string
+              expires_at:
+                description: Optional ISO8601 expiration
+                nullable: true
+                type: string
+              indexes:
+                description: Index restrictions, e.g. ["*"] or specific uids
+                items:
+                  type: string
+                type: array
+              name:
+                description: Meilisearch key name
+                nullable: true
+                type: string
+              secret_name:
+                type: string
+              secret_namespace:
+                description: Where to store the created key secret
+                type: string
+              server_ref:
+                description: Reference to Server name in same namespace
+                type: string
+            required:
+            - actions
+            - indexes
+            - secret_name
+            - secret_namespace
+            - server_ref
+            type: object
+          status:
+            nullable: true
+            properties:
+              message:
+                nullable: true
+                type: string
+              ready:
+                type: boolean
+              uid:
+                description: UID of key on server
+                nullable: true
+                type: string
+            required:
+            - ready
+            type: object
+        required:
+        - spec
+        title: Key
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+

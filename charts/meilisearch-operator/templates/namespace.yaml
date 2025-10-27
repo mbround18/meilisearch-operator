@@ -1,0 +1,12 @@
+{{- if .Values.createNamespace }}
+{{- $ns := .Values.namespace | default .Release.Namespace -}}
+{{- $existing := lookup "v1" "Namespace" "" $ns -}}
+{{- if not $existing }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  annotations:
+    {{- toYaml .Values.namespaceAnnotations | nindent 4 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: meilisearch-samples
+version: 0.1.0
+kubeVersion: ">=1.25.0-0"
+description: Sample Meilisearch CRs for testing the operator
+type: application
+appVersion: "0.1.0"

@@ -1,0 +1,12 @@
+apiVersion: meili.operator.dev/v1beta1
+kind: Server
+metadata:
+  name: {{ .Values.server.name }}
+  namespace: {{ .Values.namespace }}
+  annotations:
+    {{- toYaml .Values.annotations | nindent 4 }}
+spec:
+  image: {{ .Values.server.image }}
+  replicas: {{ .Values.server.replicas }}
+  storage: {{ .Values.server.storage }}
+  port: {{ .Values.server.port }}

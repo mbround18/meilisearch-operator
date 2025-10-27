@@ -1,0 +1,36 @@
+namespace: meilisearch-testing
+createNamespace: false
+
+annotations: {}
+namespaceAnnotations: {}
+podAnnotations: {}
+
+server:
+  name: meili-a
+  image: getmeili/meilisearch:v1.11.1
+  replicas: 1
+  storage: 5Gi
+  port: 7700
+
+indexes:
+  - name: movies
+    uid: movies
+    primaryKey: id
+    adminKey:
+      create: true
+      secretName: movies-admin-key
+
+keys:
+  - name: movies-search-key
+    description: Search-only key for movies index
+    actions: [search]
+    indexes: [movies]
+    secretName: movies-search-key
+
+networkPolicy:
+  # Enable ingress NetworkPolicy for Meilisearch pods in this namespace
+  enabled: true
+  # Namespace where the operator runs; allowed as ingress source on port 7700
+  operatorNamespace: meilisearch-operator
+  # Also allow kubelet/health probes or external diagnostics on 7700 (ipBlock 0.0.0.0/0, port-scoped)
+  allowProbes: true

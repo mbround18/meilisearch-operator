@@ -1,0 +1,36 @@
+apiVersion: meili.operator.dev/v1beta1
+kind: Server
+metadata:
+  name: meili-a
+  namespace: default
+spec:
+  image: getmeili/meilisearch:v1.11.1
+  replicas: 1
+  storage: 5Gi
+  service_type: ClusterIP
+  port: 7700
+---
+apiVersion: meili.operator.dev/v1alpha1
+kind: Index
+metadata:
+  name: movies
+  namespace: default
+spec:
+  server_ref: meili-a
+  uid: movies
+  primary_key: id
+  delete_on_finalize: false
+---
+apiVersion: meili.operator.dev/v1alpha1
+kind: Key
+metadata:
+  name: movies-search-key
+  namespace: default
+spec:
+  server_ref: meili-a
+  name: search-movies
+  description: Search-only key for movies index
+  actions: [search]
+  indexes: [movies]
+  secret_namespace: default
+  secret_name: movies-search-key

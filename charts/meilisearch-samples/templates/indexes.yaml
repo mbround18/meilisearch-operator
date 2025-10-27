@@ -1,0 +1,26 @@
+{{- range .Values.indexes }}
+apiVersion: meili.operator.dev/v1alpha1
+kind: Index
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Values.namespace }}
+  annotations:
+    {{- toYaml $.Values.annotations | nindent 4 }}
+spec:
+  server_ref: {{ $.Values.server.name }}
+  uid: {{ .uid }}
+  {{- if .primaryKey }}
+  primary_key: {{ .primaryKey }}
+  {{- end }}
+  {{- if .adminKey }}
+  admin_key:
+    create: {{ .adminKey.create | default false }}
+    {{- if .adminKey.secretName }}
+    secret_name: {{ .adminKey.secretName }}
+    {{- end }}
+    {{- if .adminKey.secretNamespace }}
+    secret_namespace: {{ .adminKey.secretNamespace }}
+    {{- end }}
+  {{- end }}
+---
+{{- end }}

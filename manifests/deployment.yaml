@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: meilisearch-operator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meilisearch-operator
+  namespace: meilisearch-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: meilisearch-operator
+  template:
+    metadata:
+      labels:
+        app: meilisearch-operator
+    spec:
+      serviceAccountName: meilisearch-operator
+      containers:
+        - name: operator
+          image: ghcr.io/yourorg/meilisearch-operator:latest
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: OPERATOR_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace

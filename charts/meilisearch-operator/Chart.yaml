@@ -1,0 +1,7 @@
+apiVersion: v2
+name: meilisearch-operator
+version: 0.1.0
+kubeVersion: ">=1.25.0-0"
+description: Kubernetes operator for Meilisearch (Rust kube-rs)
+type: application
+appVersion: "0.1.0"

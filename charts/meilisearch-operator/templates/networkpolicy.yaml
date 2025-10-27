@@ -1,0 +1,49 @@
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.egress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: meilisearch-operator-egress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: meilisearch-operator
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.networkPolicy.egress.allowDns }}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- if and .Values.networkPolicy.egress.kubeApi.enabled (.Values.networkPolicy.egress.kubeApi.cidrs) }}
+    - to:
+        {{- range .Values.networkPolicy.egress.kubeApi.cidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: 443
+          protocol: TCP
+    {{- end }}
+    - to:
+        {{- if .Values.networkPolicy.egress.allowedNamespaces }}
+        {{- range .Values.networkPolicy.egress.allowedNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+        {{- else }}
+        - namespaceSelector:
+            {{- toYaml (.Values.networkPolicy.egress.namespaceSelector | default dict) | nindent 12 }}
+        {{- end }}
+      ports:
+        {{- range .Values.networkPolicy.egress.ports }}
+        - port: {{ .port }}
+          protocol: {{ .protocol | default "TCP" }}
+        {{- end }}
+{{- end }}

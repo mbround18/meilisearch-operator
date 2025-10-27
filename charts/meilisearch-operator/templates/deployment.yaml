@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meilisearch-operator
+  namespace: {{ .Values.namespace }}
+  annotations:
+    {{- toYaml .Values.annotations | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: meilisearch-operator
+  template:
+    metadata:
+      labels:
+        app: meilisearch-operator
+      annotations:
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+    spec:
+      serviceAccountName: meilisearch-operator
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: OPERATOR_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

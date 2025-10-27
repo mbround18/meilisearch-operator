@@ -1,0 +1,14 @@
+services:
+  operator:
+    image: mbround18/meilisearch-operator:${VERSION:-latest}
+    build: ./
+    container_name: meilisearch-operator
+    restart: unless-stopped
+    environment:
+      - WATCH_NAMESPACE=
+      - POD_NAME=meilisearch-operator
+      - OPERATOR_NAME=meilisearch-operator
+      - LOG_LEVEL=info
+    volumes:
+      - ./manifests/rbac.yaml:/manifests/rbac.yaml
+    command: ["meilisearch-operator", "--zap-level=info", "--namespace=", "--leader-elect=false"]

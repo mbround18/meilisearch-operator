@@ -1,0 +1,48 @@
+image:
+  repository: mbround18/meilisearch-operator
+  tag: latest
+  pullPolicy: Always
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nameOverride: ""
+fullnameOverride: ""
+
+rbac:
+  create: true
+
+namespace: meilisearch-operator
+createNamespace: false
+
+annotations: {}
+namespaceAnnotations: {}
+serviceAccount:
+  annotations: {}
+podAnnotations: {}
+
+networkPolicy:
+  # Enable NetworkPolicy resources for the operator
+  enabled: true
+  egress:
+    # Enable egress restrictions (set false to disable all NP egress rules)
+    enabled: true
+    # Allow DNS egress for name resolution (UDP/TCP 53)
+    allowDns: true
+    ports:
+      - port: 7700
+        protocol: TCP
+    # Restrict Meilisearch egress to specific namespaces by label selector
+    namespaceSelector: {}
+    # Or explicitly list allowed namespaces by name (uses metadata.name label)
+    allowedNamespaces: []
+    # Allow access to Kubernetes API server (HTTPS 443). Adjust CIDRs to your cluster API IPs.
+    kubeApi:
+      enabled: true
+      cidrs:
+        - 10.43.0.1/32

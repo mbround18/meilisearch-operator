@@ -1,0 +1,30 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  rust-build-test:
+    uses: mbround18/gh-reusable/.github/workflows/rust-build-n-test.yml@main
+    with:
+      toolchain: stable
+      components: "clippy rustfmt"
+      target: ""
+      runs-on: ubuntu-latest
+
+  docker-release:
+    needs: rust-build-test
+    uses: mbround18/gh-reusable/.github/workflows/docker-release.yaml@main
+    with:
+      image: mbround18/meilisearch-operator
+      context: .
+      dockerfile: ./Dockerfile
+      platforms: linux/amd64,linux/arm64
+      ghcr: true
+      ghcr_username: ${{ github.repository_owner }}
+      dockerhub_username: ${{ vars.DOCKER_USERNAME }}
+    secrets:
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}

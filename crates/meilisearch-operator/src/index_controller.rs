@@ -36,14 +36,14 @@ pub async fn reconcile(idx: Arc<Index>, ctx: Arc<Ctx>) -> Result<Action, Reconci
     // Handle deletion via finalizer
     if idx.metadata.deletion_timestamp.is_some() {
         // If the referenced Server is being deleted, skip Meilisearch calls and just remove our finalizer.
-        if !server_is_deleting(&ctx.client, &ns, server).await? {
-            if idx.spec.delete_on_finalize {
-                let endpoint = format!("http://{}.{}.svc.cluster.local:7700", server, ns);
-                let master_key = get_master_key(&ctx.client, &ns, server).await?;
-                let client = MeiliClient::new(&endpoint, Some(&master_key))?;
-                let task = client.delete_index(&idx.spec.uid).await?;
-                let _ = task.wait_for_completion(&client, None, None).await?;
-            }
+        if !server_is_deleting(&ctx.client, &ns, server).await?
+            && idx.spec.delete_on_finalize
+        {
+            let endpoint = format!("http://{}.{}.svc.cluster.local:7700", server, ns);
+            let master_key = get_master_key(&ctx.client, &ns, server).await?;
+            let client = MeiliClient::new(&endpoint, Some(&master_key))?;
+            let task = client.delete_index(&idx.spec.uid).await?;
+            let _ = task.wait_for_completion(&client, None, None).await?;
         }
         remove_finalizer(&ctx.client, &ns, &name).await?;
         return Ok(Action::await_change());

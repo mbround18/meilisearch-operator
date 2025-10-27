@@ -40,10 +40,10 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
     // Finalizer deletion path
     if key.metadata.deletion_timestamp.is_some() {
         // If the referenced Server is being deleted, skip Meilisearch calls and just remove our finalizer.
-        if !server_is_deleting(&ctx.client, &ns, server).await? {
-            if let Some(uid) = key.status.as_ref().and_then(|s| s.uid.as_ref()) {
-                client.delete_key(uid).await?;
-            }
+        if !server_is_deleting(&ctx.client, &ns, server).await?
+            && let Some(uid) = key.status.as_ref().and_then(|s| s.uid.as_ref())
+        {
+            client.delete_key(uid).await?;
         }
         remove_finalizer(&ctx.client, &ns, &name).await?;
         return Ok(Action::await_change());

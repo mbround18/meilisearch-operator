@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.19
 # Multi-stage build for a small final image
 
-FROM rust:1.90 AS builder
+FROM rust:1.91 AS builder
 WORKDIR /app
 # Cache dependencies
 COPY Cargo.toml Cargo.lock ./

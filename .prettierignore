@@ -1,0 +1,31 @@
+# Ignore Rust sources (handled by rustfmt)
+**/*.rs
+
+# Ignore Cargo metadata
+Cargo.toml
+Cargo.lock
+crates/**/Cargo.toml
+
+# Ignore build artifacts
+/target/
+**/target/
+
+# Ignore Helm templates that use Go templating with conflicting {{ }}
+charts/**/templates/**
+charts/**/charts/**
+charts/**/values.yaml
+charts/**/values.schema.json
+
+# Ignore generated manifests
+manifests/*.yaml
+
+# Common junk
+.node_modules
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+*.swo

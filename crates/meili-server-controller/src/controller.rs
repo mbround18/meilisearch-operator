@@ -7,18 +7,11 @@ use kube::{
     Api, Client, ResourceExt,
     runtime::controller::{Action, Controller},
 };
-use rand::{distr::Alphanumeric, Rng};
+use meili_crds::server::{Server, ServerSpec, ServerStatus};
+use meili_shared::error::ReconcileError;
+use rand::{Rng, distr::Alphanumeric};
 use tokio::time::Duration;
 use tracing::error;
-
-use crate::{
-    crds::{
-        index::Index,
-        key::Key,
-        server::{Server, ServerSpec, ServerStatus},
-    },
-    error::ReconcileError,
-};
 
 const FINALIZER: &str = "meili.operator.dev/finalizer";
 
@@ -28,7 +21,7 @@ pub struct Ctx {
     pub operator_namespace: String,
 }
 
-pub fn controller(client: Client, _operator_namespace: String) -> Controller<Server> {
+pub fn controller(client: Client) -> Controller<Server> {
     let api: Api<Server> = Api::all(client.clone());
     Controller::new(api, Default::default()).shutdown_on_signal()
 }
@@ -37,39 +30,32 @@ pub async fn reconcile(server: Arc<Server>, ctx: Arc<Ctx>) -> Result<Action, Rec
     let ns = server.namespace().unwrap();
     let name = server.name_any();
 
-    // Handle deletion with finalizer (cleanup cross-namespace secret)
     if server.metadata.deletion_timestamp.is_some() {
-        // Fast-delete dependent Keys and Indexes that reference this server.
-        // We remove their finalizers and delete the CRs since the backing data is going away.
         fast_delete_children(&ctx.client, &ns, &name).await?;
-        // delete operator namespace copy secret (cannot use ownerRef across namespaces)
         delete_operator_copy(&ctx.client, &ctx.operator_namespace, &ns, &name).await?;
-        // remove our finalizer
         remove_finalizer(&ctx.client, &ns, &name).await?;
         return Ok(Action::await_change());
     }
 
-    // Ensure finalizer present early
     ensure_finalizer(&ctx.client, &ns, &name, &server).await?;
 
-    // Ensure master key secret in app namespace
     let owner = owner_ref(&server);
-    let mk = ensure_master_key_secret(&ctx.client, &ns, &name, &owner).await?;
-    // Mirror master key into operator namespace for management
-    ensure_operator_copy(&ctx.client, &ctx.operator_namespace, &ns, &name, &mk).await?;
+    let master_key = ensure_master_key_secret(&ctx.client, &ns, &name, &owner).await?;
+    ensure_operator_copy(
+        &ctx.client,
+        &ctx.operator_namespace,
+        &ns,
+        &name,
+        &master_key,
+    )
+    .await?;
 
-    // Ensure Service + StatefulSet
     ensure_service(&ctx.client, &ns, &name, server.spec.port, &owner).await?;
     ensure_statefulset(&ctx.client, &ns, &name, &server.spec, &owner).await?;
 
-    // Wait for meilisearch to be healthy
-    let endpoint = format!(
-        "http://{}.{}.svc.cluster.local:{}",
-        name, ns, server.spec.port
-    );
-    wait_meili_healthy(&endpoint, &mk).await?;
+    let endpoint = format!("http://{}.{}.svc:{}", name, ns, server.spec.port);
+    wait_meili_healthy(&endpoint, &master_key).await?;
 
-    // Update status
     let status = ServerStatus {
         ready: true,
         endpoint: Some(endpoint),
@@ -88,12 +74,16 @@ pub async fn reconcile(server: Arc<Server>, ctx: Arc<Ctx>) -> Result<Action, Rec
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
+pub fn error_policy(_server: Arc<Server>, err: &ReconcileError, _ctx: Arc<Ctx>) -> Action {
+    error!(error=?err, "reconcile failed");
+    Action::requeue(Duration::from_secs(30))
+}
+
 async fn fast_delete_children(
     client: &Client,
     ns: &str,
     server_name: &str,
 ) -> Result<(), ReconcileError> {
-    // Helper to remove finalizers and delete a named object, ignoring 404s
     async fn remove_finals_and_delete<
         T: kube::Resource<DynamicType = ()> + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
     >(
@@ -116,8 +106,9 @@ async fn fast_delete_children(
         Ok(())
     }
 
-    // Delete Keys
+    // Keys
     {
+        use meili_crds::key::Key;
         let api: Api<Key> = Api::namespaced(client.clone(), ns);
         let list = api.list(&kube::api::ListParams::default()).await?;
         for k in list
@@ -130,9 +121,9 @@ async fn fast_delete_children(
             }
         }
     }
-
-    // Delete Indexes
+    // Indexes
     {
+        use meili_crds::index::Index;
         let api: Api<Index> = Api::namespaced(client.clone(), ns);
         let list = api.list(&kube::api::ListParams::default()).await?;
         for i in list
@@ -145,12 +136,7 @@ async fn fast_delete_children(
             }
         }
     }
-
     Ok(())
-}
-pub fn error_policy(_server: Arc<Server>, err: &ReconcileError, _ctx: Arc<Ctx>) -> Action {
-    error!(error = ?err, "reconcile failed");
-    Action::requeue(Duration::from_secs(30))
 }
 
 async fn ensure_master_key_secret(
@@ -287,6 +273,9 @@ fn build_statefulset(name: &str, spec: &ServerSpec, owner: &OwnerReference) -> S
         .unwrap_or_else(|| "getmeili/meilisearch:latest".into());
     let port = spec.port as i32;
     let has_storage = spec.storage.is_some();
+    // Compute a simple FNV-1a 64-bit hash over the ServerSpec JSON to force rollout on changes
+    let spec_json = serde_json::to_string(spec).unwrap_or_default();
+    let spec_hash = fnv1a64(&spec_json);
     StatefulSet {
         metadata: kube::core::ObjectMeta {
             name: Some(name.to_string()),
@@ -314,6 +303,10 @@ fn build_statefulset(name: &str, spec: &ServerSpec, owner: &OwnerReference) -> S
                     labels: Some(std::collections::BTreeMap::from([(
                         String::from("app"),
                         name.to_string(),
+                    )])),
+                    annotations: Some(std::collections::BTreeMap::from([(
+                        String::from("meili.operator.dev/spec-hash"),
+                        spec_hash,
                     )])),
                     ..Default::default()
                 }),
@@ -420,7 +413,19 @@ fn build_statefulset(name: &str, spec: &ServerSpec, owner: &OwnerReference) -> S
     }
 }
 
+// Simple FNV-1a 64-bit hash for stable annotation value without extra deps
+fn fnv1a64(s: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325; // offset basis
+    let prime: u64 = 0x100000001b3;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(prime);
+    }
+    format!("{hash:016x}")
+}
+
 async fn wait_meili_healthy(endpoint: &str, master_key: &str) -> Result<(), ReconcileError> {
+    let _ = master_key; // unused for now
     wait_meili_healthy_with(endpoint, master_key, Duration::from_secs(2), 120).await
 }
 
@@ -483,7 +488,6 @@ async fn ensure_finalizer(
 
 async fn remove_finalizer(client: &Client, ns: &str, name: &str) -> Result<(), ReconcileError> {
     let api: Api<Server> = Api::namespaced(client.clone(), ns);
-    // Remove by setting empty list if ours is the only one; otherwise filter requires GET first, but Merge with null removes all
     let pp = kube::api::PatchParams::apply("meilisearch-operator");
     let patch = serde_json::json!({"metadata": {"finalizers": null}});
     let _ = api
@@ -498,7 +502,6 @@ async fn delete_operator_copy(
     ns: &str,
     name: &str,
 ) -> Result<(), ReconcileError> {
-    use k8s_openapi::api::core::v1::Secret;
     let secrets: Api<Secret> = Api::namespaced(client.clone(), op_ns);
     let sec_name = format!("{}-{}-meili-master", ns, name);
     let dp = kube::api::DeleteParams::default();
@@ -515,7 +518,6 @@ mod tests_server_controller {
     use axum::http::{StatusCode, header::CONTENT_TYPE};
     use axum::{Router, routing::get};
     use std::net::SocketAddr;
-    use tokio::task::JoinHandle;
 
     fn owner() -> OwnerReference {
         OwnerReference {
@@ -563,7 +565,6 @@ mod tests_server_controller {
 
     #[tokio::test]
     async fn wait_meili_healthy_succeeds_quickly() {
-        // Start a tiny HTTP server that always returns 200 for /health
         let app = Router::new().route(
             "/health",
             get(|| async {
@@ -577,8 +578,7 @@ mod tests_server_controller {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let local = listener.local_addr().unwrap();
-        let server: JoinHandle<()> =
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let endpoint = format!("http://{}", local);
         let res = wait_meili_healthy_with(&endpoint, "unused", Duration::from_millis(10), 5).await;

@@ -1,5 +1,13 @@
 [workspace]
-members = ["crates/meilisearch-operator"]
+members = [
+	"crates/meilisearch-operator",
+	"crates/meili-crds",
+	"crates/meili-shared",
+	"crates/meili-index-controller",
+	"crates/meili-key-controller",
+	"crates/meili-server-controller",
+	"crates/meili-metrics",
+]
 resolver = "2"
 
 [workspace.package]

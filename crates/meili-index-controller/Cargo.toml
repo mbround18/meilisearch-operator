@@ -1,0 +1,19 @@
+[package]
+name = "meili-index-controller"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["time"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+time = { version = "0.3", features = ["parsing", "formatting"] }
+kube = { version = "2.0.1", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.26.0", features = ["latest", "schemars"] }
+meilisearch-sdk = "0.30.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+meili-crds = { path = "../meili-crds" }
+meili-shared = { path = "../meili-shared" }

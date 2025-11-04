@@ -1,5 +1,1 @@
-pub mod crds;
-pub mod error;
-pub mod index_controller;
-pub mod key_controller;
-pub mod server_controller;
+// Empty lib: main binary uses split crates (meili-*-controller, meili-crds, meili-shared)

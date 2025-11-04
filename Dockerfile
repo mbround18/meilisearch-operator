@@ -1,22 +1,44 @@
 # syntax=docker/dockerfile:1.19
-# Multi-stage build for a small final image
+# Multi-stage build using cargo-chef for optimal dependency caching and a small final image
 
-FROM rust:1.91 AS builder
+ARG RUST_VERSION=1.91
+ARG TARGET_TRIPLE=x86_64-unknown-linux-musl
+
+# Base with Rust toolchain and cargo-chef installed
+FROM rust:${RUST_VERSION} AS chef
 WORKDIR /app
-# Cache dependencies
-COPY Cargo.toml Cargo.lock ./
-COPY crates/meilisearch-operator/Cargo.toml crates/meilisearch-operator/Cargo.toml
-RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/* \
-	&& rustup target add x86_64-unknown-linux-musl \
-	&& mkdir -p crates/meilisearch-operator/src \
-	&& echo "fn main(){}" > crates/meilisearch-operator/src/main.rs \
-	&& cargo build --release -p meilisearch-operator --target x86_64-unknown-linux-musl
-# Build real binary
-COPY . .
-RUN cargo build --release -p meilisearch-operator --target x86_64-unknown-linux-musl
+ARG TARGET_TRIPLE
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add ${TARGET_TRIPLE} \
+    && cargo install cargo-chef --version 0.1.73
 
+# Compute dependency graph
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Build dependency layers
+FROM chef AS builder
+WORKDIR /app
+ARG TARGET_TRIPLE
+COPY --from=planner /app/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo chef cook --release --target ${TARGET_TRIPLE} --recipe-path recipe.json --locked
+
+# Build the actual binary
+COPY . .
+ENV RUSTFLAGS="-C strip=symbols"
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release -p meilisearch-operator --target ${TARGET_TRIPLE} --locked
+
+# Final minimal image
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/meilisearch-operator /usr/local/bin/meilisearch-operator
+ARG TARGET_TRIPLE
+COPY --from=builder /app/target/${TARGET_TRIPLE}/release/meilisearch-operator /usr/local/bin/meilisearch-operator
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/meilisearch-operator"]

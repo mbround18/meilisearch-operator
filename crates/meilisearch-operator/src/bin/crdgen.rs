@@ -1,5 +1,5 @@
 use kube::core::CustomResourceExt;
-use meilisearch_operator::crds::{index::Index, key::Key, server::Server};
+use meili_crds::{index::Index, key::Key, server::Server};
 
 fn main() {
     let crds = vec![Server::crd(), Index::crd(), Key::crd()];

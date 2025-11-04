@@ -1,8 +1,9 @@
 use futures::StreamExt;
 use kube::Client;
-use meilisearch_operator::{
-    index_controller as idx, key_controller as keyc, server_controller as srv,
-};
+use meili_index_controller::controller as idx;
+use meili_key_controller::controller as keyc;
+use meili_metrics::{Config as MetricsConfig, start_background as start_metrics};
+use meili_server_controller::controller as srv;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -21,13 +22,14 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     let operator_namespace =
         std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "meilisearch-operator".into());
+    let metrics_bind = std::env::var("METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".into());
 
     // Server controller
     let srv_ctx = Arc::new(srv::Ctx {
         client: client.clone(),
         operator_namespace: operator_namespace.clone(),
     });
-    let srv_controller = srv::controller(client.clone(), operator_namespace.clone())
+    let srv_controller = srv::controller(client.clone())
         .run(srv::reconcile, srv::error_policy, srv_ctx)
         .for_each(|res| async move {
             if let Err(e) = res {
@@ -59,11 +61,24 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+    // Metrics server
+    let metrics_client = client.clone();
+    let metrics_ns = operator_namespace.clone();
+    let metrics_handle = {
+        let cfg = MetricsConfig {
+            operator_namespace: metrics_ns,
+            bind_addr: metrics_bind,
+        };
+        start_metrics(metrics_client, cfg)
+    };
+
     tokio::select! {
         _ = srv_controller => {},
         _ = idx_controller => {},
         _ = key_controller => {},
         _ = tokio::signal::ctrl_c() => { info!("shutdown signal received"); }
     }
+    // Best-effort join (non-blocking shutdown)
+    let _ = metrics_handle.join();
     Ok(())
 }

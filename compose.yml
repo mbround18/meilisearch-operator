@@ -1,6 +1,6 @@
 services:
   operator:
-    image: mbround18/meilisearch-operator:${VERSION:-latest}
+    image: mbround18/meilisearch-operator:${VERSION:-development}
     build: ./
     container_name: meilisearch-operator
     restart: unless-stopped

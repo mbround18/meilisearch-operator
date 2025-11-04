@@ -10,6 +10,10 @@ IMAGE_REPOSITORY ?= $(if $(IMAGE_REPOSITORY_FROM_COMPOSE),$(IMAGE_REPOSITORY_FRO
 IMAGE_TAG ?= $(VVERSION)
 IMAGE := $(IMAGE_REPOSITORY):$(IMAGE_TAG)
 
+# Short git SHA tag for dev deployments
+SHORT_SHA := $(shell git rev-parse --short=7 HEAD)
+DEV_TAG := sha-$(SHORT_SHA)
+
 OPERATOR_NAMESPACE ?= meilisearch-operator
 SAMPLES_NAMESPACE ?= meilisearch-testing
 CREATE_NAMESPACE ?= false
@@ -26,7 +30,7 @@ HELM ?= helm
 COMPOSE ?= docker compose
 KUBECTL ?= kubectl
 
-.PHONY: all build deploy crds docker-build docker-push compose-build compose-push helm-lint helm-package helm-clean helm-install-operator helm-install-samples undeploy print-vars version kget kdescribe klogs ensure-namespaces
+.PHONY: all build deploy deploy-dev crds docker-build docker-push compose-build compose-push helm-lint helm-package helm-clean helm-install-operator helm-install-samples undeploy print-vars version kget kdescribe klogs ensure-namespaces
 
 all: build
 
@@ -95,6 +99,20 @@ helm-install-samples:
 
 deploy: compose-build compose-push crds ensure-namespaces helm-install-operator helm-install-samples
 	@echo "==> Deploy complete"
+
+# Dev deploy: tag image with sha-XXXXXXX, build, push, and deploy operator only
+deploy-dev: crds ensure-namespaces
+	@echo "==> Deploying dev image with tag $(DEV_TAG)"
+	VERSION=$(DEV_TAG) $(COMPOSE) build
+	VERSION=$(DEV_TAG) $(COMPOSE) push
+	@echo "==> Installing/upgrading operator: $(OPERATOR_RELEASE) in namespace $(OPERATOR_NAMESPACE) with tag $(DEV_TAG)"
+	$(HELM) upgrade --install $(OPERATOR_RELEASE) $(OPERATOR_CHART_DIR) \
+		--namespace $(OPERATOR_NAMESPACE) $(if $(filter true,$(CREATE_NAMESPACE)),--create-namespace,) \
+		--set namespace=$(OPERATOR_NAMESPACE) \
+		--set createNamespace=$(CREATE_NAMESPACE) \
+		--set image.repository=$(IMAGE_REPOSITORY) \
+		--set image.tag=$(DEV_TAG) \
+		--set image.version=$(DEV_TAG)
 
 undeploy:
 	@echo "==> Uninstalling Helm releases"

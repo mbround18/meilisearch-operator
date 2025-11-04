@@ -8,7 +8,7 @@ license = "Apache-2.0"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.9"
@@ -16,16 +16,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures = "0.3"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 
-# kube-rs stack
 kube = { version = "2.0.1", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.26.0", features = ["latest", "schemars"] }
 schemars = "1"
-
-# Meilisearch client
-meilisearch-sdk = "0.30.0"
-
 serde_yaml = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+meili-index-controller = { path = "../meili-index-controller" }
+meili-key-controller = { path = "../meili-key-controller" }
+meili-server-controller = { path = "../meili-server-controller" }
+meili-crds = { path = "../meili-crds" }
+meili-metrics = { path = "../meili-metrics" }
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time"] }

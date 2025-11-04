@@ -11,10 +11,9 @@ use time::OffsetDateTime;
 use tokio::time::Duration;
 use tracing::error;
 
-use crate::{
-    crds::key::{Key, KeyStatus},
-    error::ReconcileError,
-};
+use meili_crds::key::{Key, KeyStatus};
+use meili_shared::error::ReconcileError;
+use meili_shared::name::normalize_kebab_dedup;
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -32,14 +31,12 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
     let ns = key.namespace().unwrap();
     let name = key.name_any();
     let server = &key.spec.server_ref;
-    let endpoint = format!("http://{}.{}.svc.cluster.local:7700", server, ns);
+    let endpoint = format!("http://{}.{}.svc:7700", server, ns);
     let master_key = get_master_key(&ctx.client, &ns, server).await?;
     let client = MeiliClient::new(&endpoint, Some(&master_key))?;
     let mut status_message: Option<String> = None;
 
-    // Finalizer deletion path
     if key.metadata.deletion_timestamp.is_some() {
-        // If the referenced Server is being deleted, skip Meilisearch calls and just remove our finalizer.
         if !server_is_deleting(&ctx.client, &ns, server).await?
             && let Some(uid) = key.status.as_ref().and_then(|s| s.uid.as_ref())
         {
@@ -51,7 +48,6 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
 
     ensure_finalizer(&ctx.client, &ns, &name, &key).await?;
 
-    // Prefer adopting an existing Secret's key if present and valid
     if let Some(secret_key) = existing_secret_key(&ctx.client, &key).await?
         && key_exists_by_value_http(&endpoint, &master_key, &secret_key).await?
     {
@@ -81,9 +77,7 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
         return Ok(Action::requeue(Duration::from_secs(1200)));
     }
 
-    // Try to find an existing key that matches our spec to avoid duplicates (exact, then relaxed)
     if let Some(existing) = find_matching_key_http(&endpoint, &master_key, &key).await? {
-        // Adopt existing exact match
         store_key_secret(
             &ctx.client,
             &ns,
@@ -112,7 +106,6 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
     } else if let Some(existing) =
         find_relaxed_matching_key_http(&endpoint, &master_key, &key).await?
     {
-        // Adopt relaxed match (ignore name/description differences)
         store_key_secret(
             &ctx.client,
             &ns,
@@ -141,19 +134,13 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
     }
 
     let mut kb = KeyBuilder::new();
-    // Determine desired name and normalize: split by '-' and remove duplicate tokens
-    let desired_name = if let Some(n) = &key.spec.name {
-        n.clone()
-    } else {
-        name.clone()
-    };
+    let desired_name = key.spec.name.clone().unwrap_or_else(|| name.clone());
     let desired_name = normalize_kebab_dedup(&desired_name);
     kb.with_name(&desired_name);
     if let Some(d) = &key.spec.description {
         kb.with_description(d);
     }
     kb.with_indexes(&key.spec.indexes);
-    // Map action strings to enum, fallback to Unknown variant
     let actions: Vec<MeiliAction> = key
         .spec
         .actions
@@ -190,8 +177,6 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
     }
 
     let created = kb.execute(&client).await?;
-
-    // Store in target secret
     store_key_secret(
         &ctx.client,
         &ns,
@@ -202,7 +187,6 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
     )
     .await?;
 
-    // Update status
     let status = KeyStatus {
         uid: Some(created.uid.clone()),
         ready: true,
@@ -217,7 +201,6 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
             &kube::api::Patch::Merge(serde_json::json!({"status": status })),
         )
         .await?;
-
     Ok(Action::requeue(Duration::from_secs(1200)))
 }
 
@@ -238,6 +221,39 @@ async fn get_master_key(client: &Client, ns: &str, server: &str) -> Result<Strin
         .get("masterKey")
         .ok_or_else(|| anyhow::anyhow!("missing key"))?;
     Ok(String::from_utf8(val.0.clone())?)
+}
+
+// If a Secret already exists at the target location, try to reuse that key value
+async fn existing_secret_key(client: &Client, key: &Key) -> Result<Option<String>, ReconcileError> {
+    use k8s_openapi::api::core::v1::Secret;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &key.spec.secret_namespace);
+    match secrets.get(&key.spec.secret_name).await {
+        Ok(sec) => {
+            if let Some(sd) = sec.string_data.as_ref()
+                && let Some(v) = sd.get("key")
+            {
+                return Ok(Some(v.clone()));
+            }
+            if let Some(data) = sec.data.as_ref()
+                && let Some(v) = data.get("key")
+            {
+                return Ok(String::from_utf8(v.0.clone()).ok());
+            }
+            Ok(None)
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// Verify if a key string exists on the Meilisearch server by listing all keys
+async fn key_exists_by_value_http(
+    endpoint: &str,
+    master_key: &str,
+    key_value: &str,
+) -> Result<bool, ReconcileError> {
+    let all = list_all_keys_http(endpoint, master_key).await?;
+    Ok(all.iter().any(|k| k.key == key_value))
 }
 
 async fn store_key_secret(
@@ -285,8 +301,6 @@ async fn store_key_secret(
     })?;
     Ok(())
 }
-
-// -------- Matching existing keys via HTTP API --------
 
 #[derive(Debug, serde::Deserialize)]
 struct KeyItem {
@@ -378,14 +392,12 @@ fn matches_spec(item: &KeyItem, key: &Key) -> bool {
     if !same_string_opt(&key.spec.description, &item.description) {
         return false;
     }
-    // actions and indexes compare as unordered sets
     if !eq_unordered(&normalize_actions(&key.spec.actions), &item.actions) {
         return false;
     }
     if !eq_unordered(&key.spec.indexes, &item.indexes) {
         return false;
     }
-    // expires_at: if spec has a value, it must match; if None, accept any
     match (&key.spec.expires_at, &item.expires_at) {
         (Some(se), Some(ie)) => {
             parse_rfc3339_opt(&Some(se.clone())) == parse_rfc3339_opt(&Some(ie.clone()))
@@ -404,7 +416,6 @@ async fn find_matching_key_http(
     Ok(all.into_iter().find(|k| matches_spec(k, key)))
 }
 
-// Relaxed matching: ignore name/description differences, match on actions/indexes/expiry only
 fn matches_spec_relaxed(item: &KeyItem, key: &Key) -> bool {
     if !eq_unordered(&normalize_actions(&key.spec.actions), &item.actions) {
         return false;
@@ -428,39 +439,6 @@ async fn find_relaxed_matching_key_http(
 ) -> Result<Option<KeyItem>, ReconcileError> {
     let all = list_all_keys_http(endpoint, master_key).await?;
     Ok(all.into_iter().find(|k| matches_spec_relaxed(k, key)))
-}
-
-// If a Secret already exists at the target location, try to reuse that key value
-async fn existing_secret_key(client: &Client, key: &Key) -> Result<Option<String>, ReconcileError> {
-    use k8s_openapi::api::core::v1::Secret;
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), &key.spec.secret_namespace);
-    match secrets.get(&key.spec.secret_name).await {
-        Ok(sec) => {
-            if let Some(sd) = sec.string_data.as_ref()
-                && let Some(v) = sd.get("key")
-            {
-                return Ok(Some(v.clone()));
-            }
-            if let Some(data) = sec.data.as_ref()
-                && let Some(v) = data.get("key")
-            {
-                return Ok(String::from_utf8(v.0.clone()).ok());
-            }
-            Ok(None)
-        }
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-// Verify if a key string exists on the Meilisearch server by listing all keys
-async fn key_exists_by_value_http(
-    endpoint: &str,
-    master_key: &str,
-    key_value: &str,
-) -> Result<bool, ReconcileError> {
-    let all = list_all_keys_http(endpoint, master_key).await?;
-    Ok(all.iter().any(|k| k.key == key_value))
 }
 
 async fn ensure_finalizer(
@@ -499,29 +477,104 @@ async fn key_uid(client: &Client, ns: &str, name: &str) -> Result<String, Reconc
     Ok(k.metadata.uid.unwrap_or_default())
 }
 
-fn normalize_kebab_dedup(input: &str) -> String {
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut parts_out: Vec<String> = Vec::new();
-    for raw in input.split('-') {
-        let part = raw.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if seen.insert(part.to_string()) {
-            parts_out.push(part.to_string());
-        }
-    }
-    parts_out.join("-")
-}
-
 async fn server_is_deleting(client: &Client, ns: &str, name: &str) -> Result<bool, ReconcileError> {
-    use crate::crds::server::Server;
+    use meili_crds::server::Server;
     let api: Api<Server> = Api::namespaced(client.clone(), ns);
     if let Some(srv) = api.get_opt(name).await? {
         Ok(srv.metadata.deletion_timestamp.is_some())
     } else {
-        // Treat missing as deleted/going away
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests_key_controller_helpers {
+    use super::*;
+
+    #[test]
+    fn same_string_opt_works() {
+        assert!(same_string_opt(&None, &Some("x".into())));
+        assert!(same_string_opt(&Some("a".into()), &Some("a".into())));
+        assert!(!same_string_opt(&Some("a".into()), &Some("b".into())));
+    }
+
+    #[test]
+    fn parse_rfc3339_opt_parses() {
+        let s = Some("2024-01-01T00:00:00Z".to_string());
+        assert!(parse_rfc3339_opt(&s).is_some());
+        assert!(parse_rfc3339_opt(&None).is_none());
+    }
+
+    #[test]
+    fn eq_unordered_works() {
+        assert!(eq_unordered(&["a", "b"], &["b", "a"]));
+        assert!(!eq_unordered(&["a"], &["a", "b"]));
+    }
+
+    fn key_item(
+        actions: &[&str],
+        indexes: &[&str],
+        name: Option<&str>,
+        desc: Option<&str>,
+        exp: Option<&str>,
+    ) -> KeyItem {
+        KeyItem {
+            name: name.map(|s| s.to_string()),
+            description: desc.map(|s| s.to_string()),
+            key: "k".into(),
+            uid: "u".into(),
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+            indexes: indexes.iter().map(|s| s.to_string()).collect(),
+            expires_at: exp.map(|s| s.to_string()),
+        }
+    }
+
+    fn key_spec(
+        name: Option<&str>,
+        desc: Option<&str>,
+        actions: &[&str],
+        indexes: &[&str],
+        exp: Option<&str>,
+    ) -> Key {
+        Key {
+            metadata: Default::default(),
+            spec: meili_crds::key::KeySpec {
+                server_ref: "s".into(),
+                name: name.map(|s| s.to_string()),
+                description: desc.map(|s| s.to_string()),
+                actions: actions.iter().map(|s| s.to_string()).collect(),
+                indexes: indexes.iter().map(|s| s.to_string()).collect(),
+                expires_at: exp.map(|s| s.to_string()),
+                secret_namespace: "ns".into(),
+                secret_name: "n".into(),
+            },
+            status: None,
+        }
+    }
+
+    #[test]
+    fn matches_spec_true_when_all_match() {
+        let item = key_item(
+            &["*"],
+            &["idx"],
+            Some("name"),
+            Some("desc"),
+            Some("2024-01-01T00:00:00Z"),
+        );
+        let key = key_spec(
+            Some("name"),
+            Some("desc"),
+            &["*"],
+            &["idx"],
+            Some("2024-01-01T00:00:00Z"),
+        );
+        assert!(matches_spec(&item, &key));
+    }
+
+    #[test]
+    fn matches_spec_relaxed_ignores_name_desc() {
+        let item = key_item(&["search"], &["idx"], Some("n1"), Some("d1"), None);
+        let key = key_spec(Some("n2"), Some("d2"), &["search"], &["idx"], None);
+        assert!(matches_spec_relaxed(&item, &key));
     }
 }

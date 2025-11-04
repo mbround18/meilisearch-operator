@@ -10,10 +10,9 @@ use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::error;
 
-use crate::{
-    crds::index::{Index, IndexStatus},
-    error::ReconcileError,
-};
+use meili_crds::index::{Index, IndexStatus};
+use meili_shared::error::ReconcileError;
+use meili_shared::name::normalize_kebab_dedup;
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -33,13 +32,9 @@ pub async fn reconcile(idx: Arc<Index>, ctx: Arc<Ctx>) -> Result<Action, Reconci
     let server = &idx.spec.server_ref;
     let mut status_message: Option<String> = None;
 
-    // Handle deletion via finalizer
     if idx.metadata.deletion_timestamp.is_some() {
-        // If the referenced Server is being deleted, skip Meilisearch calls and just remove our finalizer.
-        if !server_is_deleting(&ctx.client, &ns, server).await?
-            && idx.spec.delete_on_finalize
-        {
-            let endpoint = format!("http://{}.{}.svc.cluster.local:7700", server, ns);
+        if !server_is_deleting(&ctx.client, &ns, server).await? && idx.spec.delete_on_finalize {
+            let endpoint = format!("http://{}.{}.svc:7700", server, ns);
             let master_key = get_master_key(&ctx.client, &ns, server).await?;
             let client = MeiliClient::new(&endpoint, Some(&master_key))?;
             let task = client.delete_index(&idx.spec.uid).await?;
@@ -51,21 +46,18 @@ pub async fn reconcile(idx: Arc<Index>, ctx: Arc<Ctx>) -> Result<Action, Reconci
 
     ensure_finalizer(&ctx.client, &ns, &name, &idx).await?;
 
-    let endpoint = format!("http://{}.{}.svc.cluster.local:7700", server, ns);
+    let endpoint = format!("http://{}.{}.svc:7700", server, ns);
     let master_key = get_master_key(&ctx.client, &ns, server).await?;
     let client = MeiliClient::new(&endpoint, Some(&master_key))?;
 
-    // Ensure index exists
     let task = client
         .create_index(&idx.spec.uid, idx.spec.primary_key.as_deref())
         .await?;
     let _ = task.wait_for_completion(&client, None, None).await?;
 
-    // Optionally create an admin key scoped to this index and store it in a Secret
     if let Some(ak) = &idx.spec.admin_key
         && ak.create
     {
-        // First, try to adopt an existing matching key to avoid duplicates
         if let Some(existing) =
             find_matching_admin_key_http(&endpoint, &master_key, &idx.spec.uid).await?
         {
@@ -111,7 +103,6 @@ pub async fn reconcile(idx: Arc<Index>, ctx: Arc<Ctx>) -> Result<Action, Reconci
         }
     }
 
-    // Update status
     let status = IndexStatus {
         ready: true,
         message: status_message,
@@ -134,29 +125,12 @@ pub fn error_policy(_idx: Arc<Index>, err: &ReconcileError, _ctx: Arc<Ctx>) -> A
     Action::requeue(Duration::from_secs(60))
 }
 
-fn normalize_kebab_dedup(input: &str) -> String {
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut parts_out: Vec<String> = Vec::new();
-    for raw in input.split('-') {
-        let part = raw.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if seen.insert(part.to_string()) {
-            parts_out.push(part.to_string());
-        }
-    }
-    parts_out.join("-")
-}
-
 async fn server_is_deleting(client: &Client, ns: &str, name: &str) -> Result<bool, ReconcileError> {
-    use crate::crds::server::Server;
+    use meili_crds::server::Server;
     let api: Api<Server> = Api::namespaced(client.clone(), ns);
     if let Some(srv) = api.get_opt(name).await? {
         Ok(srv.metadata.deletion_timestamp.is_some())
     } else {
-        // Treat missing as deleted/going away
         Ok(true)
     }
 }
@@ -219,8 +193,6 @@ async fn store_index_key_secret(
     })?;
     Ok(())
 }
-
-// -------- Matching existing admin key via HTTP API --------
 
 #[derive(Debug, serde::Deserialize)]
 struct KeyItem {
@@ -287,7 +259,7 @@ fn eq_unordered<T: Eq + std::hash::Hash + Clone>(a: &[T], b: &[T]) -> bool {
 }
 
 fn matches_admin(index_uid: &str, item: &KeyItem) -> bool {
-    let expected_name = format!("{}-admin", index_uid);
+    let expected_name = normalize_kebab_dedup(&format!("{}-admin", index_uid));
     let expected_desc = format!("Admin key for index {}", index_uid);
     let actions_ok = item.actions.iter().any(|a| a == "*");
     let indexes_ok = eq_unordered(&[index_uid.to_string()], &item.indexes);
@@ -341,4 +313,43 @@ async fn remove_finalizer(client: &Client, ns: &str, name: &str) -> Result<(), R
         .patch(name, &pp, &kube::api::Patch::Merge(&patch))
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_index_controller {
+    use super::*;
+
+    #[test]
+    fn eq_unordered_works() {
+        assert!(eq_unordered(&[1, 2, 3], &[3, 2, 1]));
+        assert!(!eq_unordered(&[1, 2], &[1, 2, 3]));
+    }
+
+    #[test]
+    fn matches_admin_true_when_all_match() {
+        let idx = "books";
+        let item = KeyItem {
+            name: Some(normalize_kebab_dedup(&format!("{}-admin", idx))),
+            description: Some(format!("Admin key for index {}", idx)),
+            key: "abc".into(),
+            uid: "uid".into(),
+            actions: vec!["*".into()],
+            indexes: vec![idx.into()],
+        };
+        assert!(matches_admin(idx, &item));
+    }
+
+    #[test]
+    fn matches_admin_false_when_index_differs() {
+        let idx = "books";
+        let item = KeyItem {
+            name: Some(normalize_kebab_dedup(&format!("{}-admin", idx))),
+            description: Some(format!("Admin key for index {}", idx)),
+            key: "abc".into(),
+            uid: "uid".into(),
+            actions: vec!["*".into()],
+            indexes: vec!["movies".into()],
+        };
+        assert!(!matches_admin(idx, &item));
+    }
 }

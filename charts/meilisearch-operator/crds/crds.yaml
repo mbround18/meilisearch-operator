@@ -26,7 +26,6 @@ spec:
                 type: string
               port:
                 default: 7700
-                description: Port for meilisearch HTTP, default 7700
                 format: uint16
                 maximum: 65535.0
                 minimum: 0.0
@@ -37,10 +36,8 @@ spec:
                 type: integer
               service_type:
                 default: ClusterIP
-                description: 'Service type: ClusterIP, NodePort, LoadBalancer'
                 type: string
               storage:
-                description: Storage size, e.g. "10Gi"
                 nullable: true
                 type: string
             type: object
@@ -92,35 +89,27 @@ spec:
           spec:
             properties:
               admin_key:
-                description: 'Optional: generate an admin key with actions ["*"] scoped to this index'
                 nullable: true
                 properties:
                   create:
                     default: false
-                    description: Create an admin key scoped to this index
                     type: boolean
                   secret_name:
-                    description: Name for the Secret (defaults to "<uid>-admin-key" if None)
                     nullable: true
                     type: string
                   secret_namespace:
-                    description: Namespace to store the Secret (defaults to CR namespace if None)
                     nullable: true
                     type: string
                 type: object
               delete_on_finalize:
                 default: false
-                description: If true, delete index on CR deletion
                 type: boolean
               primary_key:
-                description: Optional primary key
                 nullable: true
                 type: string
               server_ref:
-                description: Reference to Server name in same namespace
                 type: string
               uid:
-                description: Index uid
                 type: string
             required:
             - server_ref
@@ -171,34 +160,27 @@ spec:
           spec:
             properties:
               actions:
-                description: Actions like ["search", "documents.add"]
                 items:
                   type: string
                 type: array
               description:
-                description: Description
                 nullable: true
                 type: string
               expires_at:
-                description: Optional ISO8601 expiration
                 nullable: true
                 type: string
               indexes:
-                description: Index restrictions, e.g. ["*"] or specific uids
                 items:
                   type: string
                 type: array
               name:
-                description: Meilisearch key name
                 nullable: true
                 type: string
               secret_name:
                 type: string
               secret_namespace:
-                description: Where to store the created key secret
                 type: string
               server_ref:
-                description: Reference to Server name in same namespace
                 type: string
             required:
             - actions
@@ -216,7 +198,6 @@ spec:
               ready:
                 type: boolean
               uid:
-                description: UID of key on server
                 nullable: true
                 type: string
             required:

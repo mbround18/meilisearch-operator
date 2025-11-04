@@ -1,7 +1,54 @@
-target/
-charts/
+# VCS and editor
+.git
+.gitignore
+.gitattributes
+.github/
+.vscode/
+.idea/
+*.swp
+*.swo
 *.log
 *.tmp
-*.swp
-*.bak
+
+# Rust build outputs
+/target/
+**/target/
+
+# Cargo local caches (planner/builder stages use cargo-chef cache mounts instead)
+/.cargo/
+
+# Node/yarn (not used)
+node_modules/
+
+# Python venvs
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test/coverage artifacts
+coverage/
+**/*.profraw
+
+# Local env
 .env
+.env.*
+
+# Docker compose overrides
+docker-compose.override.yml
+compose.override.yml
+
+# Helm: ignore packaged/temporary outputs, but keep charts sources
+charts/**/charts/
+charts/**/tmp/
+*.tgz
+charts/**/templates/*.rendered.yaml
+
+# Generated manifests that aren't needed during build
+manifests/*.yaml
+
+# Misc
+**/*.old
+**/*.bak

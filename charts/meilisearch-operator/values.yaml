@@ -26,6 +26,23 @@ serviceAccount:
   annotations: {}
 podAnnotations: {}
 
+metrics:
+  enabled: true
+  port: 9090
+  addr: "0.0.0.0:9090"
+  service:
+    type: ClusterIP
+    annotations: {}
+    labels: {}
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    relabelings: []
+    metricRelabelings: []
+
 networkPolicy:
   # Enable NetworkPolicy resources for the operator
   enabled: true

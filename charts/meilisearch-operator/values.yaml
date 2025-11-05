@@ -43,6 +43,22 @@ metrics:
     relabelings: []
     metricRelabelings: []
 
+probes:
+  enabled: true
+  # Use HTTP GET to the metrics server, paths below
+  liveness:
+    path: /metrics
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /metrics
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
 networkPolicy:
   # Enable NetworkPolicy resources for the operator
   enabled: true

@@ -72,12 +72,36 @@ async fn main() -> anyhow::Result<()> {
         start_metrics(metrics_client, cfg)
     };
 
+    // Unified shutdown: handle multiple Unix signals and Ctrl+C
+    #[cfg(unix)]
+    let shutdown = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt()).expect("sigint");
+        let mut sigterm = signal(SignalKind::terminate()).expect("sigterm");
+        let mut sigquit = signal(SignalKind::quit()).expect("sigquit");
+        let mut sighup = signal(SignalKind::hangup()).expect("sighup");
+
+        tokio::select! {
+            _ = sigint.recv() => info!("SIGINT received, shutting down"),
+            _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+            _ = sigquit.recv() => info!("SIGQUIT received, shutting down"),
+            _ = sighup.recv() => info!("SIGHUP received, shutting down"),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Ctrl+C received, shutting down");
+    };
+
     tokio::select! {
         _ = srv_controller => {},
         _ = idx_controller => {},
         _ = key_controller => {},
-        _ = tokio::signal::ctrl_c() => { info!("shutdown signal received"); }
+        _ = shutdown => {}
     }
+    info!("shutting down: stopping background tasks");
     // Best-effort join (non-blocking shutdown)
     let _ = metrics_handle.join();
     Ok(())

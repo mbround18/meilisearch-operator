@@ -12,7 +12,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 futures = "0.3"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 
@@ -26,6 +26,6 @@ meili-crds = { path = "../meili-crds" }
 meili-metrics = { path = "../meili-metrics" }
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
 serde_json = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }

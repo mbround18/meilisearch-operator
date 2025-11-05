@@ -20,15 +20,28 @@ spec:
         - port: 53
           protocol: TCP
     {{- end }}
-    {{- if and .Values.networkPolicy.egress.kubeApi.enabled (.Values.networkPolicy.egress.kubeApi.cidrs) }}
+    {{- if .Values.networkPolicy.egress.kubeApi.enabled }}
+    {{- $userCidrs := .Values.networkPolicy.egress.kubeApi.cidrs }}
+    {{- $kubeSvc := (lookup "v1" "Service" "default" "kubernetes") }}
+    {{- $kubeIP := "" }}
+    {{- if $kubeSvc }}
+    {{- $kubeIP = $kubeSvc.spec.clusterIP | default "" }}
+    {{- end }}
+    {{- if or $userCidrs $kubeIP }}
     - to:
-        {{- range .Values.networkPolicy.egress.kubeApi.cidrs }}
+        {{- if $userCidrs }}
+        {{- range $userCidrs }}
         - ipBlock:
             cidr: {{ . | quote }}
+        {{- end }}
+        {{- else if $kubeIP }}
+        - ipBlock:
+            cidr: {{ printf "%s/32" $kubeIP | quote }}
         {{- end }}
       ports:
         - port: 443
           protocol: TCP
+    {{- end }}
     {{- end }}
     - to:
         {{- if .Values.networkPolicy.egress.allowedNamespaces }}

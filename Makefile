@@ -113,6 +113,13 @@ deploy-dev: crds ensure-namespaces
 		--set image.repository=$(IMAGE_REPOSITORY) \
 		--set image.tag=$(DEV_TAG) \
 		--set image.version=$(DEV_TAG)
+	@echo "==> Deploying samples"
+	$(HELM) upgrade --install $(SAMPLES_RELEASE) $(SAMPLES_CHART_DIR) \
+		--namespace $(SAMPLES_NAMESPACE) $(if $(filter true,$(CREATE_NAMESPACE)),--create-namespace,) \
+		--set namespace=$(SAMPLES_NAMESPACE) \
+		--set createNamespace=$(CREATE_NAMESPACE)
+	@echo "==> Dev deploy complete"
+
 
 undeploy:
 	@echo "==> Uninstalling Helm releases"

@@ -11,6 +11,8 @@ server:
   replicas: 1
   storage: 5Gi
   port: 7700
+  incompatiblePolicy: Fail # or ResetData
+  migrateOnUpdate: true
 
 indexes:
   - name: movies

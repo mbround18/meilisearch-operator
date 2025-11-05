@@ -21,8 +21,22 @@ spec:
         properties:
           spec:
             properties:
+              data:
+                default:
+                  migrateOnUpdate: true
+                properties:
+                  migrateOnUpdate:
+                    default: true
+                    type: boolean
+                type: object
               image:
                 nullable: true
+                type: string
+              incompatiblePolicy:
+                default: fail
+                enum:
+                - fail
+                - resetData
                 type: string
               port:
                 default: 7700

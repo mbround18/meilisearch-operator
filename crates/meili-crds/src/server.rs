@@ -21,6 +21,11 @@ pub struct ServerSpec {
     pub service_type: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_incompatible_policy")]
+    #[serde(rename = "incompatiblePolicy")]
+    pub incompatible_policy: IncompatiblePolicy,
+        #[serde(default)]
+        pub data: DataSpec,
 }
 
 fn default_replicas() -> i32 {
@@ -31,6 +36,35 @@ fn default_service_type() -> String {
 }
 fn default_port() -> u16 {
     7700
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum IncompatiblePolicy {
+    Fail,
+    ResetData,
+}
+
+fn default_incompatible_policy() -> IncompatiblePolicy {
+    IncompatiblePolicy::Fail
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+pub struct DataSpec {
+    #[serde(default = "default_migrate_on_update", rename = "migrateOnUpdate")]
+    pub migrate_on_update: bool,
+}
+
+fn default_migrate_on_update() -> bool {
+    true
+}
+
+impl Default for DataSpec {
+    fn default() -> Self {
+        Self {
+            migrate_on_update: true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, JsonSchema)]
@@ -59,5 +93,10 @@ spec:
         assert_eq!(srv.spec.replicas, 1);
         assert_eq!(srv.spec.service_type, "ClusterIP");
         assert_eq!(srv.spec.port, 7700);
+        match srv.spec.incompatible_policy {
+            IncompatiblePolicy::Fail => (),
+            _ => panic!("default incompatible policy should be Fail"),
+        }
+        assert!(srv.spec.data.migrate_on_update);
     }
 }

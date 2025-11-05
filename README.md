@@ -82,7 +82,7 @@ docker run --rm -e OPERATOR_NAMESPACE=meilisearch-operator \
 
 ## CRDs at a glance
 
-- Server (v1beta1): image?, replicas (default 1), storage?, service_type (ClusterIP), port (7700)
+- Server (v1beta1): image?, replicas (default 1), storage?, service_type (ClusterIP), port (7700), incompatiblePolicy (Fail|ResetData, default Fail), data.migrateOnUpdate (default true)
 - Index (v1alpha1): server_ref, uid, primary_key?, delete_on_finalize (false), admin_key?
 - Key (v1alpha1): server_ref, name?, description?, actions[], indexes[], expires_at?, secret_namespace, secret_name
 - Policy (v1alpha1): reserved for future use
@@ -98,7 +98,15 @@ cargo run --bin crdgen > manifests/crds.yaml
 - Server
   - Generates a 64-char master key and stores it in the Server namespace and in the operator namespace.
   - Waits for `/health` before marking ready.
+  - On engine/database version incompatibility:
+    - If `spec.data.migrateOnUpdate=true` and a previous image is known, orchestrates a dump/import migration using two Jobs (old image to dump, new image to import), then scales back up; emits Kubernetes Events for start/complete/failure.
+    - Else if `spec.incompatiblePolicy=ResetData`, scales to 0, deletes PVCs, and recreates with a fresh store.
+    - Else, surfaces an error and leaves the pod stopped.
   - On deletion: removes operator copy Secret and fast-deletes related Index/Key CRs (removes their finalizers and deletes the CRs).
+
+## Metrics
+
+The operator exposes Prometheus metrics on `/metrics` (bind address via `METRICS_ADDR`, default `0.0.0.0:9090`). It reports counts of Servers/Indexes/Keys and per-index document totals labeled by namespace/server/index.
 
 - Index
   - Creates the index; optionally creates or adopts an admin key scoped to the index (`<uid>-admin`).

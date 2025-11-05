@@ -10,3 +10,6 @@ spec:
   replicas: {{ .Values.server.replicas }}
   storage: {{ .Values.server.storage }}
   port: {{ .Values.server.port }}
+  incompatiblePolicy: {{ .Values.server.incompatiblePolicy }}
+  data:
+    migrateOnUpdate: {{ .Values.server.migrateOnUpdate }}

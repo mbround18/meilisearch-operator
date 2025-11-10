@@ -7,7 +7,7 @@ podAnnotations: {}
 
 server:
   name: meili-a
-  image: getmeili/meilisearch:v1.24.0
+  image: getmeili/meilisearch:v1.25.0
   replicas: 1
   storage: 5Gi
   port: 7700

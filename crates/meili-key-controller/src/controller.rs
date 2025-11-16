@@ -18,6 +18,7 @@ use meili_shared::name::normalize_kebab_dedup;
 #[derive(Clone)]
 pub struct Ctx {
     pub client: Client,
+    pub pod_name: String,
 }
 
 pub fn controller(client: Client) -> Controller<Key> {
@@ -31,7 +32,100 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
     let ns = key.namespace().unwrap();
     let name = key.name_any();
     let server = &key.spec.server_ref;
-    let endpoint = format!("http://{}.{}.svc:7700", server, ns);
+    tracing::Span::current().record("resource.name", tracing::field::display(&name));
+    tracing::Span::current().record("resource.namespace", tracing::field::display(&ns));
+    tracing::Span::current().record("server.ref", tracing::field::display(server));
+    // Throttle HTTP interactions using degradable intervals stored in annotations
+    const LAST_CHECK_ANN: &str = "meili.operator.dev/last-check";
+    const CHECK_COUNT_ANN: &str = "meili.operator.dev/check-count";
+    const CHECK_INTERVAL_ANN: &str = "meili.operator.dev/check-interval"; // seconds
+    const BASE_INTERVAL_SECS: i64 = 30;
+    const DEGRADE_AFTER_CHECKS: i64 = 10; // ~5 minutes at 30s
+    const DEGRADED_INTERVAL_SECS: i64 = 900; // 15 minutes
+
+    let mut current_interval = key
+        .annotations()
+        .get(CHECK_INTERVAL_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(BASE_INTERVAL_SECS);
+    if let Some(cc) = key
+        .annotations()
+        .get(CHECK_COUNT_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+        && cc >= DEGRADE_AFTER_CHECKS
+    {
+        current_interval = DEGRADED_INTERVAL_SECS;
+    }
+    if let Some(ts) = key.annotations().get(LAST_CHECK_ANN) {
+        if let Ok(then) = OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        {
+            let now = OffsetDateTime::now_utc();
+            let elapsed = now - then;
+            if elapsed.whole_seconds() < current_interval {
+                let wait = (current_interval - elapsed.whole_seconds()) as u64;
+                return Ok(Action::requeue(std::time::Duration::from_secs(wait)));
+            }
+        }
+    } else {
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "".into());
+        let patch = serde_json::json!({"metadata": {"annotations": {
+            LAST_CHECK_ANN: now,
+            CHECK_COUNT_ANN: "0",
+            CHECK_INTERVAL_ANN: BASE_INTERVAL_SECS.to_string()
+        }}});
+        let pp = kube::api::PatchParams::apply("meilisearch-operator");
+        let api: Api<Key> = Api::namespaced(ctx.client.clone(), &ns);
+        let _ = api
+            .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+            .await;
+    }
+    // Gate by server readiness
+    if !meili_shared::readiness::server_ready(&ctx.client, &ns, server).await? {
+        return Ok(Action::requeue(Duration::from_secs(10)));
+    }
+    // Acquire lock
+    let lock = meili_shared::lock::LockSpec {
+        namespace: &ns,
+        name: &name,
+        holder: &ctx.pod_name,
+        ttl: time::Duration::seconds(30),
+    };
+    if !meili_shared::lock::acquire::<Key>(&ctx.client, &lock).await? {
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
+    struct Guard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+    let client_cloned = ctx.client.clone();
+    let ns_cloned = ns.clone();
+    let name_cloned = name.clone();
+    let holder = ctx.pod_name.clone();
+    let _guard = Guard(Some(move || {
+        let client = client_cloned.clone();
+        let ns = ns_cloned.clone();
+        let name = name_cloned.clone();
+        let holder = holder.clone();
+        tokio::spawn(async move {
+            let _ = meili_shared::lock::release::<Key>(
+                &client,
+                &meili_shared::lock::LockSpec {
+                    namespace: &ns,
+                    name: &name,
+                    holder: &holder,
+                    ttl: time::Duration::seconds(0),
+                },
+            )
+            .await;
+        });
+    }));
+    let endpoint = meili_shared::endpoint::meili_endpoint(&ctx.client, &ns, server, 7700).await;
     let master_key = get_master_key(&ctx.client, &ns, server).await?;
     let client = MeiliClient::new(&endpoint, Some(&master_key))?;
     let mut status_message: Option<String> = None;
@@ -48,9 +142,11 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
 
     ensure_finalizer(&ctx.client, &ns, &name, &key).await?;
 
+    // track next interval adjustments inline; use annotations later
     if let Some(secret_key) = existing_secret_key(&ctx.client, &key).await?
         && key_exists_by_value_http(&endpoint, &master_key, &secret_key).await?
     {
+        // HTTP performed
         store_key_secret(
             &ctx.client,
             &ns,
@@ -74,10 +170,38 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
                 &kube::api::Patch::Merge(serde_json::json!({"status": status })),
             )
             .await?;
-        return Ok(Action::requeue(Duration::from_secs(1200)));
+        // Update throttle annotations
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "".into());
+        let cc = key
+            .annotations()
+            .get(CHECK_COUNT_ANN)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let next_interval = if cc >= DEGRADE_AFTER_CHECKS {
+            DEGRADED_INTERVAL_SECS
+        } else {
+            BASE_INTERVAL_SECS
+        };
+        if !now.is_empty() {
+            let patch = serde_json::json!({"metadata": {"annotations": {
+                LAST_CHECK_ANN: now,
+                CHECK_COUNT_ANN: cc.to_string(),
+                CHECK_INTERVAL_ANN: next_interval.to_string()
+            }}});
+            let _ = api
+                .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+                .await;
+        }
+        return Ok(Action::requeue(std::time::Duration::from_secs(
+            next_interval as u64,
+        )));
     }
 
     if let Some(existing) = find_matching_key_http(&endpoint, &master_key, &key).await? {
+        // HTTP performed
         store_key_secret(
             &ctx.client,
             &ns,
@@ -102,10 +226,38 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
                 &kube::api::Patch::Merge(serde_json::json!({"status": status })),
             )
             .await?;
-        return Ok(Action::requeue(Duration::from_secs(1200)));
+        // Update throttle annotations
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "".into());
+        let cc = key
+            .annotations()
+            .get(CHECK_COUNT_ANN)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let next_interval = if cc >= DEGRADE_AFTER_CHECKS {
+            DEGRADED_INTERVAL_SECS
+        } else {
+            BASE_INTERVAL_SECS
+        };
+        if !now.is_empty() {
+            let patch = serde_json::json!({"metadata": {"annotations": {
+                LAST_CHECK_ANN: now,
+                CHECK_COUNT_ANN: cc.to_string(),
+                CHECK_INTERVAL_ANN: next_interval.to_string()
+            }}});
+            let _ = api
+                .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+                .await;
+        }
+        return Ok(Action::requeue(std::time::Duration::from_secs(
+            next_interval as u64,
+        )));
     } else if let Some(existing) =
         find_relaxed_matching_key_http(&endpoint, &master_key, &key).await?
     {
+        // HTTP performed
         store_key_secret(
             &ctx.client,
             &ns,
@@ -201,11 +353,55 @@ pub async fn reconcile(key: Arc<Key>, ctx: Arc<Ctx>) -> Result<Action, Reconcile
             &kube::api::Patch::Merge(serde_json::json!({"status": status })),
         )
         .await?;
-    Ok(Action::requeue(Duration::from_secs(1200)))
+    // Update throttle annotations at end if we performed HTTP
+    let pp = kube::api::PatchParams::apply("meilisearch-operator");
+    let api: Api<Key> = Api::namespaced(ctx.client.clone(), &ns);
+    let mut next_interval = BASE_INTERVAL_SECS;
+    if key.annotations().get(LAST_CHECK_ANN).is_some() {
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "".into());
+        let cc = key
+            .annotations()
+            .get(CHECK_COUNT_ANN)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        next_interval = if cc >= DEGRADE_AFTER_CHECKS {
+            DEGRADED_INTERVAL_SECS
+        } else {
+            BASE_INTERVAL_SECS
+        };
+        if !now.is_empty() {
+            let patch = serde_json::json!({"metadata": {"annotations": {
+                LAST_CHECK_ANN: now,
+                CHECK_COUNT_ANN: cc.to_string(),
+                CHECK_INTERVAL_ANN: next_interval.to_string()
+            }}});
+            let _ = api
+                .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+                .await;
+        }
+    } else if let Some(i) = key
+        .annotations()
+        .get(CHECK_INTERVAL_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        next_interval = i;
+    }
+    Ok(Action::requeue(std::time::Duration::from_secs(
+        next_interval as u64,
+    )))
 }
 
 pub fn error_policy(_key: Arc<Key>, err: &ReconcileError, _ctx: Arc<Ctx>) -> Action {
-    error!(error=?err, "key reconcile failed");
+    let summary = err.summary();
+    let allow = meili_shared::rate_limit::allow(&summary, std::time::Duration::from_secs(30));
+    if allow {
+        error!(summary=%summary, error=?err, "key reconcile failed");
+    } else {
+        tracing::debug!(summary=%summary, "suppressed duplicate error summary");
+    }
     Action::requeue(Duration::from_secs(60))
 }
 
@@ -329,8 +525,9 @@ async fn list_all_keys_http(
     endpoint: &str,
     master_key: &str,
 ) -> Result<Vec<KeyItem>, ReconcileError> {
+    use meili_shared::http_retry::retry3_quiet;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .build()
         .map_err(anyhow::Error::from)?;
     let mut out = Vec::new();
@@ -338,20 +535,25 @@ async fn list_all_keys_http(
     let limit = 1000usize;
     loop {
         let url = format!("{}/keys?offset={}&limit={}", endpoint, offset, limit);
-        let resp = client
-            .get(url)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", master_key),
-            )
-            .send()
-            .await
-            .map_err(anyhow::Error::from)?
-            .error_for_status()
-            .map_err(anyhow::Error::from)?
-            .json::<KeysPage>()
-            .await
-            .map_err(anyhow::Error::from)?;
+        let resp = retry3_quiet("list_keys_page", || {
+            let url = url.clone();
+            let client = client.clone();
+            let master_key = master_key.to_string();
+            async move {
+                let page = client
+                    .get(url)
+                    .header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {}", master_key),
+                    )
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let parsed = page.json::<KeysPage>().await?;
+                Ok(parsed)
+            }
+        })
+    .await?;
         offset += resp.results.len();
         out.extend(resp.results);
         if offset >= resp.total {

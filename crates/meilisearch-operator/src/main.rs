@@ -25,9 +25,11 @@ async fn main() -> anyhow::Result<()> {
     let metrics_bind = std::env::var("METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".into());
 
     // Server controller
+    let pod_name = std::env::var("POD_NAME").unwrap_or_else(|_| "meili-operator".into());
     let srv_ctx = Arc::new(srv::Ctx {
         client: client.clone(),
         operator_namespace: operator_namespace.clone(),
+        pod_name: pod_name.clone(),
     });
     let srv_controller = srv::controller(client.clone())
         .run(srv::reconcile, srv::error_policy, srv_ctx)
@@ -40,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     // Index controller
     let idx_ctx = Arc::new(idx::Ctx {
         client: client.clone(),
+        pod_name: pod_name.clone(),
     });
     let idx_controller = idx::controller(client.clone())
         .run(idx::reconcile, idx::error_policy, idx_ctx)
@@ -52,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     // Key controller
     let key_ctx = Arc::new(keyc::Ctx {
         client: client.clone(),
+        pod_name,
     });
     let key_controller = keyc::controller(client.clone())
         .run(keyc::reconcile, keyc::error_policy, key_ctx)
@@ -75,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     // Unified shutdown: handle multiple Unix signals and Ctrl+C
     #[cfg(unix)]
     let shutdown = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt()).expect("sigint");
         let mut sigterm = signal(SignalKind::terminate()).expect("sigterm");
         let mut sigquit = signal(SignalKind::quit()).expect("sigquit");

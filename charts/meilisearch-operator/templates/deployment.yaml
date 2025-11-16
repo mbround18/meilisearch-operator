@@ -35,6 +35,10 @@ spec:
                   fieldPath: metadata.namespace
             - name: METRICS_ADDR
               value: {{ .Values.metrics.addr | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           {{- if .Values.probes.enabled }}
           livenessProbe:
             httpGet:

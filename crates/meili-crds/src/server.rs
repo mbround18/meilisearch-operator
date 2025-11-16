@@ -1,3 +1,4 @@
+use k8s_openapi::api::core::v1::LocalObjectReference;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct ServerSpec {
     pub image: Option<String>,
+    #[serde(rename = "pullPolicy")]
+    pub pull_policy: Option<String>,
+    #[serde(rename = "imagePullSecrets")]
+    pub image_pull_secrets: Option<Vec<LocalObjectReference>>,
     #[serde(default = "default_replicas")]
     pub replicas: i32,
     pub storage: Option<String>,
@@ -24,8 +29,8 @@ pub struct ServerSpec {
     #[serde(default = "default_incompatible_policy")]
     #[serde(rename = "incompatiblePolicy")]
     pub incompatible_policy: IncompatiblePolicy,
-        #[serde(default)]
-        pub data: DataSpec,
+    #[serde(default)]
+    pub data: DataSpec,
 }
 
 fn default_replicas() -> i32 {
@@ -88,6 +93,8 @@ metadata:
     name: test
 spec:
     image: null
+    pullPolicy: null
+    imagePullSecrets: null
 "#;
         let srv: Server = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(srv.spec.replicas, 1);

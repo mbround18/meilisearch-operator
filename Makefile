@@ -30,7 +30,7 @@ HELM ?= helm
 COMPOSE ?= docker compose
 KUBECTL ?= kubectl
 
-.PHONY: all build deploy deploy-dev crds docker-build docker-push compose-build compose-push helm-lint helm-package helm-clean helm-install-operator helm-install-samples undeploy print-vars version kget kdescribe klogs ensure-namespaces
+.PHONY: all build deploy deploy-dev crds docker-build docker-push compose-build compose-push helm-lint helm-package helm-clean helm-install-operator helm-install-samples undeploy print-vars version kget kdescribe klogs ensure-namespaces rollout-namespaces
 
 all: build
 
@@ -120,6 +120,7 @@ deploy-dev: crds ensure-namespaces
 		--set namespace=$(SAMPLES_NAMESPACE) \
 		--set createNamespace=$(CREATE_NAMESPACE) \
 		--wait
+	@$(MAKE) rollout-namespaces
 	@echo "==> Dev deploy complete"
 
 
@@ -164,3 +165,26 @@ ensure-namespaces:
 		else \
 			echo "==> Skipping namespace ensure (CREATE_NAMESPACE=true)"; \
 		fi
+
+# Roll all workload types in both operator and samples namespaces
+rollout-namespaces:
+	@echo "==> Rolling workloads in $(OPERATOR_NAMESPACE)"
+	@for r in $$($(KUBECTL) -n $(OPERATOR_NAMESPACE) get deploy -o name); do \
+		$(KUBECTL) -n $(OPERATOR_NAMESPACE) rollout restart $$r || true; \
+	done
+	@for r in $$($(KUBECTL) -n $(OPERATOR_NAMESPACE) get statefulset -o name); do \
+		$(KUBECTL) -n $(OPERATOR_NAMESPACE) rollout restart $$r || true; \
+	done
+	@for r in $$($(KUBECTL) -n $(OPERATOR_NAMESPACE) get daemonset -o name); do \
+		$(KUBECTL) -n $(OPERATOR_NAMESPACE) rollout restart $$r || true; \
+	done
+	@echo "==> Rolling workloads in $(SAMPLES_NAMESPACE)"
+	@for r in $$($(KUBECTL) -n $(SAMPLES_NAMESPACE) get deploy -o name); do \
+		$(KUBECTL) -n $(SAMPLES_NAMESPACE) rollout restart $$r || true; \
+	done
+	@for r in $$($(KUBECTL) -n $(SAMPLES_NAMESPACE) get statefulset -o name); do \
+		$(KUBECTL) -n $(SAMPLES_NAMESPACE) rollout restart $$r || true; \
+	done
+	@for r in $$($(KUBECTL) -n $(SAMPLES_NAMESPACE) get daemonset -o name); do \
+		$(KUBECTL) -n $(SAMPLES_NAMESPACE) rollout restart $$r || true; \
+	done

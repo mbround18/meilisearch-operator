@@ -12,8 +12,23 @@ spec:
     - Egress
   egress:
     {{- if .Values.networkPolicy.egress.allowDns }}
+    {{- $dnsSvc := (lookup "v1" "Service" "kube-system" "kube-dns") }}
+    {{- $dnsIP := "" }}
+    {{- if $dnsSvc }}
+    {{- $dnsIP = $dnsSvc.spec.clusterIP | default "" }}
+    {{- end }}
     - to:
-        - namespaceSelector: {}
+        {{- if $dnsIP }}
+        - ipBlock:
+            cidr: {{ printf "%s/32" $dnsIP | quote }}
+        {{- else }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        {{- end }}
       ports:
         - port: 53
           protocol: UDP
@@ -43,20 +58,54 @@ spec:
           protocol: TCP
     {{- end }}
     {{- end }}
+    {{- /* Optional external webhook egress rule */}}
+    {{- if and .Values.networkPolicy.egress.webhook .Values.networkPolicy.egress.webhook.enabled }}
+    {{- $wh := .Values.networkPolicy.egress.webhook }}
+    {{- if or $wh.cidrs $wh.hostCidrs }}
     - to:
-        {{- if .Values.networkPolicy.egress.allowedNamespaces }}
-        {{- range .Values.networkPolicy.egress.allowedNamespaces }}
+        {{- /* Support both cidrs (new) and legacy hostCidrs */}}
+        {{- if $wh.cidrs }}
+        {{- range $wh.cidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+        {{- else if $wh.hostCidrs }}
+        {{- range $wh.hostCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+        {{- end }}
+      ports:
+        {{- if $wh.ports }}
+        {{- range $wh.ports }}
+        - port: {{ .port }}
+          protocol: {{ .protocol | default "TCP" }}
+        {{- end }}
+        {{- else }}
+        - port: 443
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- /* Meilisearch / additional namespace egress rule */}}
+    {{- $allowed := .Values.networkPolicy.egress.allowedNamespaces }}
+    {{- $nsSel := .Values.networkPolicy.egress.namespaceSelector }}
+    {{- if or (and $allowed (gt (len $allowed) 0)) (and $nsSel (gt (len (toYaml $nsSel)) 0)) }}
+    - to:
+        {{- if and $allowed (gt (len $allowed) 0) }}
+        {{- range $allowed }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ . | quote }}
         {{- end }}
-        {{- else }}
+        {{- else if and $nsSel (gt (len (toYaml $nsSel)) 0) }}
         - namespaceSelector:
-            {{- toYaml (.Values.networkPolicy.egress.namespaceSelector | default dict) | nindent 12 }}
+            {{- toYaml $nsSel | nindent 12 }}
         {{- end }}
       ports:
         {{- range .Values.networkPolicy.egress.ports }}
         - port: {{ .port }}
           protocol: {{ .protocol | default "TCP" }}
         {{- end }}
+    {{- end }}
 {{- end }}

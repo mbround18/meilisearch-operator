@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::{Container, EnvVar, EnvVarSource, PersistentVolumeClaim, PodSpec, PodTemplateSpec, Secret, SecretKeySelector, Service, Volume, VolumeMount};
+use k8s_openapi::api::core::v1::{
+    Container, EnvVar, EnvVarSource, PersistentVolumeClaim, PodSpec, PodTemplateSpec, Secret,
+    SecretKeySelector, Service, Volume, VolumeMount,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use kube::{
     Api, Client, ResourceExt,
@@ -20,6 +23,7 @@ const FINALIZER: &str = "meili.operator.dev/finalizer";
 pub struct Ctx {
     pub client: Client,
     pub operator_namespace: String,
+    pub pod_name: String,
 }
 
 pub fn controller(client: Client) -> Controller<Server> {
@@ -30,6 +34,98 @@ pub fn controller(client: Client) -> Controller<Server> {
 pub async fn reconcile(server: Arc<Server>, ctx: Arc<Ctx>) -> Result<Action, ReconcileError> {
     let ns = server.namespace().unwrap();
     let name = server.name_any();
+    tracing::Span::current().record("resource.name", tracing::field::display(&name));
+    tracing::Span::current().record("resource.namespace", tracing::field::display(&ns));
+
+    // Throttle Meili health checks using degradable intervals on annotations
+    const LAST_CHECK_ANN: &str = "meili.operator.dev/last-check";
+    const CHECK_COUNT_ANN: &str = "meili.operator.dev/check-count";
+    const CHECK_INTERVAL_ANN: &str = "meili.operator.dev/check-interval"; // seconds
+    const BASE_INTERVAL_SECS: i64 = 30;
+    const DEGRADE_AFTER_CHECKS: i64 = 10;
+    const DEGRADED_INTERVAL_SECS: i64 = 900; // 15m
+    let mut current_interval = server
+        .annotations()
+        .get(CHECK_INTERVAL_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(BASE_INTERVAL_SECS);
+    if let Some(cc) = server
+        .annotations()
+        .get(CHECK_COUNT_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+        && cc >= DEGRADE_AFTER_CHECKS
+    {
+        current_interval = DEGRADED_INTERVAL_SECS;
+    }
+    if let Some(ts) = server.annotations().get(LAST_CHECK_ANN) {
+        if let Ok(then) =
+            time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        {
+            let now = time::OffsetDateTime::now_utc();
+            let elapsed = now - then;
+            if elapsed.whole_seconds() < current_interval {
+                let wait = (current_interval - elapsed.whole_seconds()) as u64;
+                return Ok(Action::requeue(std::time::Duration::from_secs(wait)));
+            }
+        }
+    } else {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "".into());
+        if !now.is_empty() {
+            let patch = serde_json::json!({"metadata": {"annotations": {
+                LAST_CHECK_ANN: now,
+                CHECK_COUNT_ANN: "0",
+                CHECK_INTERVAL_ANN: BASE_INTERVAL_SECS.to_string()
+            }}});
+            let pp = kube::api::PatchParams::apply("meilisearch-operator");
+            let api: Api<Server> = Api::namespaced(ctx.client.clone(), &ns);
+            let _ = api
+                .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+                .await;
+        }
+    }
+
+    // Acquire per-object lock to avoid multi-replica contention
+    let lock = meili_shared::lock::LockSpec {
+        namespace: &ns,
+        name: &name,
+        holder: &ctx.pod_name,
+        ttl: time::Duration::seconds(120),
+    };
+    if !meili_shared::lock::acquire::<Server>(&ctx.client, &lock).await? {
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
+    struct Guard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+    let client_cloned = ctx.client.clone();
+    let ns_cloned = ns.clone();
+    let name_cloned = name.clone();
+    let holder = ctx.pod_name.clone();
+    let _guard = Guard(Some(move || {
+        let client = client_cloned.clone();
+        let ns = ns_cloned.clone();
+        let name = name_cloned.clone();
+        let holder = holder.clone();
+        tokio::spawn(async move {
+            let _ = meili_shared::lock::release::<Server>(
+                &client,
+                &meili_shared::lock::LockSpec {
+                    namespace: &ns,
+                    name: &name,
+                    holder: &holder,
+                    ttl: time::Duration::seconds(0),
+                },
+            )
+            .await;
+        });
+    }));
 
     if server.metadata.deletion_timestamp.is_some() {
         fast_delete_children(&ctx.client, &ns, &name).await?;
@@ -54,15 +150,22 @@ pub async fn reconcile(server: Arc<Server>, ctx: Arc<Ctx>) -> Result<Action, Rec
     ensure_service(&ctx.client, &ns, &name, server.spec.port, &owner).await?;
     ensure_statefulset(&ctx.client, &ns, &name, &server.spec, &owner).await?;
 
-    let endpoint = format!("http://{}.{}.svc:{}", name, ns, server.spec.port);
+    let endpoint = meili_shared::endpoint::meili_endpoint(&ctx.client, &ns, &name, server.spec.port).await;
+    let _did_health_http = false;
     match wait_meili_healthy(&endpoint, &master_key).await {
         Ok(_) => {}
         Err(e) => {
-            let incompatible = is_meili_incompatible(&ctx.client, &ns, &name).await.unwrap_or(false);
+            let incompatible = is_meili_incompatible(&ctx.client, &ns, &name)
+                .await
+                .unwrap_or(false);
             if incompatible {
                 // Prefer migration when enabled; else follow incompatible_policy
                 if server.spec.data.migrate_on_update {
-                    let desired_image = server.spec.image.clone().unwrap_or_else(|| "getmeili/meilisearch:latest".into());
+                    let desired_image = server
+                        .spec
+                        .image
+                        .clone()
+                        .unwrap_or_else(|| "getmeili/meilisearch:latest".into());
                     let last_image = server
                         .annotations()
                         .get("meili.operator.dev/last-image")
@@ -71,11 +174,30 @@ pub async fn reconcile(server: Arc<Server>, ctx: Arc<Ctx>) -> Result<Action, Rec
                         run_migration(&ctx.client, &ns, &name, &old_image, &desired_image).await?;
                         return Ok(Action::requeue(Duration::from_secs(10)));
                     } else {
-                        emit_event(&ctx.client, &ns, &name, "Normal", "MigrationSkipped", "No previous image annotation; cannot migrate").await.ok();
+                        emit_event(
+                            &ctx.client,
+                            &ns,
+                            &name,
+                            "Normal",
+                            "MigrationSkipped",
+                            "No previous image annotation; cannot migrate",
+                        )
+                        .await
+                        .ok();
                     }
                 }
-                if matches!(server.spec.incompatible_policy, IncompatiblePolicy::ResetData) {
-                    reset_meili_data(&ctx.client, &ns, &name, server.spec.replicas, server.spec.storage.is_some()).await?;
+                if matches!(
+                    server.spec.incompatible_policy,
+                    IncompatiblePolicy::ResetData
+                ) {
+                    reset_meili_data(
+                        &ctx.client,
+                        &ns,
+                        &name,
+                        server.spec.replicas,
+                        server.spec.storage.is_some(),
+                    )
+                    .await?;
                     return Ok(Action::requeue(Duration::from_secs(10)));
                 }
             }
@@ -101,14 +223,49 @@ pub async fn reconcile(server: Arc<Server>, ctx: Arc<Ctx>) -> Result<Action, Rec
     // Track last deployed image for future migrations
     if let Some(img) = server.spec.image.clone() {
         let patch = serde_json::json!({"metadata": {"annotations": {"meili.operator.dev/last-image": img}}});
-        let _ = servers.patch(&name, &ss_apply, &kube::api::Patch::Merge(&patch)).await?;
+        let _ = servers
+            .patch(&name, &ss_apply, &kube::api::Patch::Merge(&patch))
+            .await?;
     }
 
-    Ok(Action::requeue(Duration::from_secs(300)))
+    // Update annotations and requeue at degraded interval if applicable
+    let pp = kube::api::PatchParams::apply("meilisearch-operator");
+    let servers: Api<Server> = Api::namespaced(ctx.client.clone(), &ns);
+    let cc = server
+        .annotations()
+        .get(CHECK_COUNT_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let next_interval = if cc >= DEGRADE_AFTER_CHECKS {
+        DEGRADED_INTERVAL_SECS
+    } else {
+        BASE_INTERVAL_SECS
+    };
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "".into());
+    if !now.is_empty() {
+        let patch = serde_json::json!({"metadata": {"annotations": {
+            LAST_CHECK_ANN: now,
+            CHECK_COUNT_ANN: cc.to_string(),
+            CHECK_INTERVAL_ANN: next_interval.to_string()
+        }}});
+        let _ = servers
+            .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+            .await;
+    }
+    Ok(Action::requeue(Duration::from_secs(next_interval as u64)))
 }
 
 pub fn error_policy(_server: Arc<Server>, err: &ReconcileError, _ctx: Arc<Ctx>) -> Action {
-    error!(error=?err, "reconcile failed");
+    let summary = err.summary();
+    let allow = meili_shared::rate_limit::allow(&summary, std::time::Duration::from_secs(30));
+    if allow {
+        error!(summary=%summary, error=?err, "reconcile failed");
+    } else {
+        tracing::debug!(summary=%summary, "suppressed duplicate error summary");
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -344,13 +501,17 @@ fn build_statefulset(name: &str, spec: &ServerSpec, owner: &OwnerReference) -> S
                     ..Default::default()
                 }),
                 spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                    image_pull_secrets: spec.image_pull_secrets.clone(),
                     containers: vec![k8s_openapi::api::core::v1::Container {
                         name: "meilisearch".into(),
                         image: Some(image),
+                        // Include binary name as first arg so tini can exec properly
                         args: Some(vec![
+                            "meilisearch".into(),
                             "--http-addr".into(),
                             format!("0.0.0.0:{}", port),
                         ]),
+                        image_pull_policy: spec.pull_policy.clone(),
                         ports: Some(vec![k8s_openapi::api::core::v1::ContainerPort {
                             container_port: port,
                             ..Default::default()
@@ -468,13 +629,22 @@ async fn wait_meili_healthy_with(
     max_attempts: u32,
 ) -> Result<(), ReconcileError> {
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(5))
         .build()
         .map_err(anyhow::Error::from)?;
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        let res = http.get(format!("{}/health", endpoint)).send().await;
+        use meili_shared::http_retry::retry3_quiet;
+        let res = retry3_quiet("health_check", || {
+            let http = http.clone();
+            let endpoint = endpoint.to_string();
+            async move {
+                let r = http.get(format!("{}/health", endpoint)).send().await?;
+                Ok(r)
+            }
+        })
+        .await;
         if let Ok(r) = res
             && r.status().is_success()
         {
@@ -501,32 +671,38 @@ fn owner_ref(server: &Server) -> OwnerReference {
 }
 
 // Inspect pods to see if Meilisearch crashed due to version incompatibility
-async fn is_meili_incompatible(client: &Client, ns: &str, name: &str) -> Result<bool, ReconcileError> {
+async fn is_meili_incompatible(
+    client: &Client,
+    ns: &str,
+    name: &str,
+) -> Result<bool, ReconcileError> {
     use k8s_openapi::api::core::v1::Pod;
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
     // Pods are labeled app=name
     let lp = kube::api::ListParams::default().labels(&format!("app={}", name));
     let list = pods.list(&lp).await?;
     for p in list.items.iter() {
-        if let Some(status) = &p.status {
-            if let Some(cs) = &status.container_statuses {
-                for c in cs {
-                    if let Some(state) = &c.last_state {
-                        if let Some(term) = &state.terminated {
-                            let msg = term.message.clone().unwrap_or_default();
-                            let reason = term.reason.clone().unwrap_or_default();
-                            if msg.contains("Your database version")
-                                && msg.contains("incompatible with your current engine version")
-                            {
-                                return Ok(true);
-                            }
-                            if reason.contains("Error") && msg.contains("incompatible") {
-                                return Ok(true);
-                            }
+        if let Some(status) = &p.status
+            && let Some(cs) = &status.container_statuses
+        {
+            for c in cs {
+                    if let Some(term) = c
+                        .last_state
+                        .as_ref()
+                        .and_then(|s| s.terminated.as_ref())
+                    {
+                        let msg = term.message.clone().unwrap_or_default();
+                        let reason = term.reason.clone().unwrap_or_default();
+                        if msg.contains("Your database version")
+                            && msg.contains("incompatible with your current engine version")
+                        {
+                            return Ok(true);
                         }
-                    }
-                }
+                        if reason.contains("Error") && msg.contains("incompatible") {
+                            return Ok(true);
+                        }
             }
+        }
         }
     }
     Ok(false)
@@ -555,10 +731,12 @@ async fn reset_meili_data(
         let prefix = format!("data-{}-", name);
         let list = pvcs.list(&kube::api::ListParams::default()).await?;
         for pvc in list.items.iter() {
-            if let Some(pvc_name) = pvc.metadata.name.as_deref() {
-                if pvc_name.starts_with(&prefix) {
-                    let _ = pvcs.delete(pvc_name, &kube::api::DeleteParams::default()).await;
-                }
+            if let Some(pvc_name) =
+                pvc.metadata.name.as_deref().filter(|n| n.starts_with(&prefix))
+            {
+                let _ = pvcs
+                    .delete(pvc_name, &kube::api::DeleteParams::default())
+                    .await;
             }
         }
     }
@@ -615,7 +793,14 @@ async fn delete_operator_copy(
     }
 }
 
-async fn emit_event(client: &Client, ns: &str, name: &str, type_: &str, reason: &str, message: &str) -> Result<(), ReconcileError> {
+async fn emit_event(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    type_: &str,
+    reason: &str,
+    message: &str,
+) -> Result<(), ReconcileError> {
     use k8s_openapi::api::core::v1::Event;
     let events: Api<Event> = Api::namespaced(client.clone(), ns);
     let ev = Event {
@@ -642,7 +827,13 @@ async fn emit_event(client: &Client, ns: &str, name: &str, type_: &str, reason: 
     Ok(())
 }
 
-async fn run_migration(client: &Client, ns: &str, name: &str, old_image: &str, new_image: &str) -> Result<(), ReconcileError> {
+async fn run_migration(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    old_image: &str,
+    new_image: &str,
+) -> Result<(), ReconcileError> {
     // Only support single replica with PVC for now
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), ns);
     let sts = sts_api.get(name).await?;
@@ -654,20 +845,53 @@ async fn run_migration(client: &Client, ns: &str, name: &str, old_image: &str, n
         .map(|v| !v.is_empty())
         .unwrap_or(false);
     if replicas != 1 || !has_pvc {
-        emit_event(client, ns, name, "Warning", "MigrationUnsupported", "Migration requires replicas=1 with persistent storage").await.ok();
+        emit_event(
+            client,
+            ns,
+            name,
+            "Warning",
+            "MigrationUnsupported",
+            "Migration requires replicas=1 with persistent storage",
+        )
+        .await
+        .ok();
         return Ok(());
     }
 
-    emit_event(client, ns, name, "Normal", "MigrationStarted", &format!("from {} to {}", old_image, new_image)).await.ok();
+    emit_event(
+        client,
+        ns,
+        name,
+        "Normal",
+        "MigrationStarted",
+        &format!("from {} to {}", old_image, new_image),
+    )
+    .await
+    .ok();
 
     // scale sts to 0
     let pp = kube::api::PatchParams::apply("meilisearch-operator");
-    let _ = sts_api.patch(name, &pp, &kube::api::Patch::Merge(&serde_json::json!({"spec": {"replicas": 0}}))).await?;
+    let _ = sts_api
+        .patch(
+            name,
+            &pp,
+            &kube::api::Patch::Merge(&serde_json::json!({"spec": {"replicas": 0}})),
+        )
+        .await?;
 
     // Ensure dump job
     match ensure_dump_job(client, ns, name, old_image).await? {
         JobPhase::Failed => {
-            emit_event(client, ns, name, "Warning", "MigrationFailed", "dump job failed").await.ok();
+            emit_event(
+                client,
+                ns,
+                name,
+                "Warning",
+                "MigrationFailed",
+                "dump job failed",
+            )
+            .await
+            .ok();
             return Ok(());
         }
         JobPhase::Running | JobPhase::Pending => return Ok(()),
@@ -677,24 +901,58 @@ async fn run_migration(client: &Client, ns: &str, name: &str, old_image: &str, n
     // Ensure import job
     match ensure_import_job(client, ns, name, new_image).await? {
         JobPhase::Failed => {
-            emit_event(client, ns, name, "Warning", "MigrationFailed", "import job failed").await.ok();
+            emit_event(
+                client,
+                ns,
+                name,
+                "Warning",
+                "MigrationFailed",
+                "import job failed",
+            )
+            .await
+            .ok();
             return Ok(());
         }
         JobPhase::Running | JobPhase::Pending => return Ok(()),
         JobPhase::Succeeded => {}
     }
 
-    emit_event(client, ns, name, "Normal", "MigrationComplete", &format!("from {} to {}", old_image, new_image)).await.ok();
+    emit_event(
+        client,
+        ns,
+        name,
+        "Normal",
+        "MigrationComplete",
+        &format!("from {} to {}", old_image, new_image),
+    )
+    .await
+    .ok();
 
     // scale back to original replicas
-    let _ = sts_api.patch(name, &pp, &kube::api::Patch::Merge(&serde_json::json!({"spec": {"replicas": replicas}}))).await?;
+    let _ = sts_api
+        .patch(
+            name,
+            &pp,
+            &kube::api::Patch::Merge(&serde_json::json!({"spec": {"replicas": replicas}})),
+        )
+        .await?;
     Ok(())
 }
 
 #[derive(PartialEq, Eq)]
-enum JobPhase { Pending, Running, Succeeded, Failed }
+enum JobPhase {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+}
 
-async fn ensure_dump_job(client: &Client, ns: &str, name: &str, image: &str) -> Result<JobPhase, ReconcileError> {
+async fn ensure_dump_job(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    image: &str,
+) -> Result<JobPhase, ReconcileError> {
     let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
     let job_name = format!("{}-migrate-dump", name);
     if let Some(job) = jobs.get_opt(&job_name).await? {
@@ -702,11 +960,18 @@ async fn ensure_dump_job(client: &Client, ns: &str, name: &str, image: &str) -> 
     }
     let job = build_dump_job(&job_name, name, image);
     let params = kube::api::PatchParams::apply("meilisearch-operator").force();
-    let _ = jobs.patch(&job_name, &params, &kube::api::Patch::Apply(&job)).await?;
+    let _ = jobs
+        .patch(&job_name, &params, &kube::api::Patch::Apply(&job))
+        .await?;
     Ok(JobPhase::Pending)
 }
 
-async fn ensure_import_job(client: &Client, ns: &str, name: &str, image: &str) -> Result<JobPhase, ReconcileError> {
+async fn ensure_import_job(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    image: &str,
+) -> Result<JobPhase, ReconcileError> {
     let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
     let job_name = format!("{}-migrate-import", name);
     if let Some(job) = jobs.get_opt(&job_name).await? {
@@ -714,17 +979,26 @@ async fn ensure_import_job(client: &Client, ns: &str, name: &str, image: &str) -
     }
     let job = build_import_job(&job_name, name, image);
     let params = kube::api::PatchParams::apply("meilisearch-operator").force();
-    let _ = jobs.patch(&job_name, &params, &kube::api::Patch::Apply(&job)).await?;
+    let _ = jobs
+        .patch(&job_name, &params, &kube::api::Patch::Apply(&job))
+        .await?;
     Ok(JobPhase::Pending)
 }
 
 fn job_phase(job: &Job) -> JobPhase {
     if let Some(st) = &job.status {
-        if let Some(s) = st.succeeded { if s > 0 { return JobPhase::Succeeded; } }
-        if let Some(f) = st.failed { if f > 0 { return JobPhase::Failed; } }
-        if let Some(a) = st.active { if a > 0 { return JobPhase::Running; } }
+        if st.succeeded.unwrap_or(0) > 0 {
+            JobPhase::Succeeded
+        } else if st.failed.unwrap_or(0) > 0 {
+            JobPhase::Failed
+        } else if st.active.unwrap_or(0) > 0 {
+            JobPhase::Running
+        } else {
+            JobPhase::Pending
+        }
+    } else {
+        JobPhase::Pending
     }
-    JobPhase::Pending
 }
 
 fn build_dump_job(job_name: &str, server_name: &str, image: &str) -> Job {
@@ -755,7 +1029,13 @@ sleep 10; kill $pid || true; wait $pid || true;".into(),
     build_job(job_name, server_name, image, &pvc, &cmd)
 }
 
-fn build_job(job_name: &str, server_name: &str, image: &str, pvc_name: &str, command: &[String]) -> Job {
+fn build_job(
+    job_name: &str,
+    server_name: &str,
+    image: &str,
+    pvc_name: &str,
+    command: &[String],
+) -> Job {
     let env = vec![EnvVar {
         name: "MASTER_KEY".into(),
         value_from: Some(EnvVarSource {
@@ -772,20 +1052,41 @@ fn build_job(job_name: &str, server_name: &str, image: &str, pvc_name: &str, com
         name: "migrate".into(),
         image: Some(image.into()),
         command: Some(command.to_vec()),
-        volume_mounts: Some(vec![VolumeMount { name: "data".into(), mount_path: "/meili_data".into(), ..Default::default() }]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "data".into(),
+            mount_path: "/meili_data".into(),
+            ..Default::default()
+        }]),
         env: Some(env),
         ..Default::default()
     };
     let pod_spec = PodSpec {
         containers: vec![container],
         restart_policy: Some("OnFailure".into()),
-        volumes: Some(vec![Volume { name: "data".into(), persistent_volume_claim: Some(k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource { claim_name: pvc_name.into(), ..Default::default() }), ..Default::default() }]),
+        volumes: Some(vec![Volume {
+            name: "data".into(),
+            persistent_volume_claim: Some(
+                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                    claim_name: pvc_name.into(),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        }]),
         ..Default::default()
     };
     Job {
-        metadata: kube::core::ObjectMeta { name: Some(job_name.into()), ..Default::default() },
+        metadata: kube::core::ObjectMeta {
+            name: Some(job_name.into()),
+            ..Default::default()
+        },
         spec: Some(JobSpec {
-            template: PodTemplateSpec { metadata: Some(kube::core::ObjectMeta { ..Default::default() }), spec: Some(pod_spec) },
+            template: PodTemplateSpec {
+                metadata: Some(kube::core::ObjectMeta {
+                    ..Default::default()
+                }),
+                spec: Some(pod_spec),
+            },
             backoff_limit: Some(1),
             ..Default::default()
         }),
@@ -815,12 +1116,16 @@ mod tests_server_controller {
     fn builds_service_and_statefulset_specs() {
         let spec = ServerSpec {
             image: Some("getmeili/meilisearch:v1.11.1".into()),
+            pull_policy: None,
+            image_pull_secrets: None,
             replicas: 1,
             storage: Some("5Gi".into()),
             service_type: "ClusterIP".into(),
             port: 7700,
             incompatible_policy: IncompatiblePolicy::Fail,
-            data: meili_crds::server::DataSpec { migrate_on_update: true },
+            data: meili_crds::server::DataSpec {
+                migrate_on_update: true,
+            },
         };
         let svc = build_service("meili-a", 7700, &owner());
         assert_eq!(svc.metadata.name.as_deref(), Some("meili-a"));
@@ -832,7 +1137,8 @@ mod tests_server_controller {
         let sts = build_statefulset("meili-a", &spec, &owner());
         let tmpl = sts.spec.as_ref().unwrap().template.clone();
         let c = &tmpl.spec.as_ref().unwrap().containers[0];
-        assert_eq!(c.args.as_ref().unwrap()[0], "--http-addr");
+        assert_eq!(c.args.as_ref().unwrap()[0], "meilisearch");
+        assert_eq!(c.args.as_ref().unwrap()[1], "--http-addr");
         assert!(matches!(
             sts.spec
                 .as_ref()

@@ -7,6 +7,13 @@ metadata:
     {{- toYaml .Values.annotations | nindent 4 }}
 spec:
   image: {{ .Values.server.image }}
+  pullPolicy: {{ .Values.server.pullPolicy | default nil }}
+  {{- if .Values.server.imagePullSecrets }}
+  imagePullSecrets:
+  {{- range .Values.server.imagePullSecrets }}
+    - name: {{ .name | default . }}
+  {{- end }}
+  {{- end }}
   replicas: {{ .Values.server.replicas }}
   storage: {{ .Values.server.storage }}
   port: {{ .Values.server.port }}

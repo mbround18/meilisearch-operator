@@ -111,7 +111,7 @@ async fn run_server(client: Client, cfg: Config) -> anyhow::Result<()> {
 pub fn start_background(client: Client, cfg: Config) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let sys = actix_web::rt::System::new();
-        let _ = sys.block_on(async move {
+        sys.block_on(async move {
             if let Err(e) = run_server(client, cfg).await {
                 error!(error=?e, "metrics server exited with error");
             }
@@ -143,7 +143,7 @@ async fn poll_once(ctx: &Ctx) -> anyhow::Result<()> {
         let ns = srv.namespace().unwrap_or_default();
         let name = srv.name_any();
         let port = srv.spec.port;
-        let endpoint = format!("http://{}.{}.svc:{}", name, ns, port);
+    let endpoint = meili_shared::endpoint::meili_endpoint(&ctx.client, &ns, &name, port).await;
         // Master key is stored in operator namespace as <ns>-<name>-meili-master
         let secret_name = format!("{}-{}-meili-master", ns, name);
         let master = get_master_key(&ctx.client, &ctx.cfg.operator_namespace, &secret_name).await;
@@ -170,10 +170,10 @@ async fn get_master_key(client: &Client, ns: &str, name: &str) -> anyhow::Result
     use k8s_openapi::api::core::v1::Secret;
     let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
     let sec = secrets.get(name).await?;
-    if let Some(sd) = sec.string_data.as_ref() {
-        if let Some(v) = sd.get("masterKey") {
-            return Ok(v.clone());
-        }
+    if let Some(sd) = sec.string_data.as_ref()
+        && let Some(v) = sd.get("masterKey")
+    {
+        return Ok(v.clone());
     }
     let data = sec.data.context("secret has no data")?;
     let v = data.get("masterKey").context("missing masterKey")?;

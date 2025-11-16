@@ -24,6 +24,9 @@ pub struct ServerSpec {
     /// Port for meilisearch HTTP, default 7700
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Optional webhook notifications configuration
+    #[serde(default)]
+    pub notifications: Option<NotificationsSpec>,
 }
 
 fn default_replicas() -> i32 {
@@ -41,4 +44,29 @@ pub struct ServerStatus {
     pub ready: bool,
     pub endpoint: Option<String>,
     pub message: Option<String>,
+    /// Last successfully emitted event timestamp (RFC3339)
+    pub last_event_ts: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, JsonSchema)]
+pub struct NotificationsSpec {
+    /// Webhook endpoint URL (http/https)
+    pub webhook_url: String,
+    /// Optional secret reference containing HMAC signing key
+    pub secret_ref: Option<SecretRef>,
+    /// Which events to emit; if empty defaults to ["ready", "status-change"]
+    pub events: Option<Vec<String>>,
+    /// Timeout seconds for webhook POST (default 5)
+    #[serde(default = "default_webhook_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_webhook_timeout() -> u64 { 5 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, JsonSchema)]
+pub struct SecretRef {
+    pub name: String,
+    pub namespace: Option<String>,
+    /// Key in Secret data holding HMAC key (defaults to "hmacKey")
+    pub key: Option<String>,
 }

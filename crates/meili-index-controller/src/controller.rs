@@ -13,10 +13,12 @@ use tracing::error;
 use meili_crds::index::{Index, IndexStatus};
 use meili_shared::error::ReconcileError;
 use meili_shared::name::normalize_kebab_dedup;
+use time::OffsetDateTime;
 
 #[derive(Clone)]
 pub struct Ctx {
     pub client: Client,
+    pub pod_name: String,
 }
 
 pub fn controller(client: Client) -> Controller<Index> {
@@ -30,11 +32,112 @@ pub async fn reconcile(idx: Arc<Index>, ctx: Arc<Ctx>) -> Result<Action, Reconci
     let ns = idx.namespace().unwrap();
     let name = idx.name_any();
     let server = &idx.spec.server_ref;
+    tracing::Span::current().record("resource.name", tracing::field::display(&name));
+    tracing::Span::current().record("resource.namespace", tracing::field::display(&ns));
+    tracing::Span::current().record("server.ref", tracing::field::display(server));
     let mut status_message: Option<String> = None;
+
+    // Throttle repeated HTTP checks using annotations with degradable intervals
+    const LAST_CHECK_ANN: &str = "meili.operator.dev/last-check";
+    const CHECK_COUNT_ANN: &str = "meili.operator.dev/check-count";
+    const CHECK_INTERVAL_ANN: &str = "meili.operator.dev/check-interval"; // seconds
+    const BASE_INTERVAL_SECS: i64 = 30;
+    const DEGRADE_AFTER_CHECKS: i64 = 10; // ~5 minutes at 30s
+    const DEGRADED_INTERVAL_SECS: i64 = 900; // 15 minutes
+
+    let mut current_interval = idx
+        .annotations()
+        .get(CHECK_INTERVAL_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(BASE_INTERVAL_SECS);
+    // If we've already crossed the degrade threshold, ensure interval is degraded
+    if let Some(cc) = idx
+        .annotations()
+        .get(CHECK_COUNT_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+        && cc >= DEGRADE_AFTER_CHECKS
+    {
+        current_interval = DEGRADED_INTERVAL_SECS;
+    }
+    if let Some(ts) = idx.annotations().get(LAST_CHECK_ANN) {
+        if let Ok(then) = OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        {
+            let now = OffsetDateTime::now_utc();
+            let elapsed = now - then;
+            if elapsed.whole_seconds() < current_interval {
+                let wait = (current_interval - elapsed.whole_seconds()) as u64;
+                return Ok(Action::requeue(std::time::Duration::from_secs(wait)));
+            }
+        }
+    } else {
+        // Missing annotation -> set baseline so we don't block reconcile
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "".into());
+        let patch = serde_json::json!({
+            "metadata": {"annotations": {
+                LAST_CHECK_ANN: now,
+                CHECK_COUNT_ANN: "0",
+                CHECK_INTERVAL_ANN: BASE_INTERVAL_SECS.to_string()
+            }}
+        });
+        let pp = kube::api::PatchParams::apply("meilisearch-operator");
+        let api: Api<Index> = Api::namespaced(ctx.client.clone(), &ns);
+        let _ = api
+            .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+            .await;
+    }
+
+    // Gate by server readiness
+    if !meili_shared::readiness::server_ready(&ctx.client, &ns, server).await? {
+        return Ok(Action::requeue(Duration::from_secs(10)));
+    }
+
+    // Acquire per-object lock (annotation-based)
+    let lock = meili_shared::lock::LockSpec {
+        namespace: &ns,
+        name: &name,
+        holder: &ctx.pod_name,
+        ttl: time::Duration::seconds(30),
+    };
+    if !meili_shared::lock::acquire::<Index>(&ctx.client, &lock).await? {
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
+    // Ensure release on exit
+    struct Guard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+    let client_cloned = ctx.client.clone();
+    let ns_cloned = ns.clone();
+    let name_cloned = name.clone();
+    let holder = ctx.pod_name.clone();
+    let _guard = Guard(Some(move || {
+        let client = client_cloned.clone();
+        let ns = ns_cloned.clone();
+        let name = name_cloned.clone();
+        let holder = holder.clone();
+        tokio::spawn(async move {
+            let _ = meili_shared::lock::release::<Index>(
+                &client,
+                &meili_shared::lock::LockSpec {
+                    namespace: &ns,
+                    name: &name,
+                    holder: &holder,
+                    ttl: time::Duration::seconds(0),
+                },
+            )
+            .await;
+        });
+    }));
 
     if idx.metadata.deletion_timestamp.is_some() {
         if !server_is_deleting(&ctx.client, &ns, server).await? && idx.spec.delete_on_finalize {
-            let endpoint = format!("http://{}.{}.svc:7700", server, ns);
+            let endpoint = meili_shared::endpoint::meili_endpoint(&ctx.client, &ns, server, 7700).await;
             let master_key = get_master_key(&ctx.client, &ns, server).await?;
             let client = MeiliClient::new(&endpoint, Some(&master_key))?;
             let task = client.delete_index(&idx.spec.uid).await?;
@@ -46,14 +149,21 @@ pub async fn reconcile(idx: Arc<Index>, ctx: Arc<Ctx>) -> Result<Action, Reconci
 
     ensure_finalizer(&ctx.client, &ns, &name, &idx).await?;
 
-    let endpoint = format!("http://{}.{}.svc:7700", server, ns);
+    let endpoint = meili_shared::endpoint::meili_endpoint(&ctx.client, &ns, server, 7700).await;
     let master_key = get_master_key(&ctx.client, &ns, server).await?;
     let client = MeiliClient::new(&endpoint, Some(&master_key))?;
-
-    let task = client
-        .create_index(&idx.spec.uid, idx.spec.primary_key.as_deref())
-        .await?;
-    let _ = task.wait_for_completion(&client, None, None).await?;
+    // Idempotent index ensure with tracking
+    let did_index_http;
+    if !index_exists_http(&endpoint, &master_key, &idx.spec.uid).await? {
+        let task = client
+            .create_index(&idx.spec.uid, idx.spec.primary_key.as_deref())
+            .await?;
+        let _ = task.wait_for_completion(&client, None, None).await?;
+        did_index_http = true;
+    } else {
+        tracing::info!(index=%idx.spec.uid, server=%server, "index already exists; skipping creation");
+        did_index_http = true;
+    }
 
     if let Some(ak) = &idx.spec.admin_key
         && ak.create
@@ -117,11 +227,68 @@ pub async fn reconcile(idx: Arc<Index>, ctx: Arc<Ctx>) -> Result<Action, Reconci
         )
         .await?;
 
-    Ok(Action::requeue(Duration::from_secs(600)))
+    // Update last-check + count + interval annotations and adjust requeue interval
+    let mut next_interval = BASE_INTERVAL_SECS;
+    if let Some(cc) = idx
+        .annotations()
+        .get(CHECK_COUNT_ANN)
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        let new_cc = cc + 1;
+        if new_cc >= DEGRADE_AFTER_CHECKS {
+            next_interval = DEGRADED_INTERVAL_SECS;
+        }
+        if did_index_http {
+            let now = OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "".into());
+            if !now.is_empty() {
+                let patch = serde_json::json!({
+                    "metadata": {"annotations": {
+                        LAST_CHECK_ANN: now,
+                        CHECK_COUNT_ANN: new_cc.to_string(),
+                        CHECK_INTERVAL_ANN: next_interval.to_string()
+                    }}
+                });
+                let _ = api
+                    .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+                    .await;
+            }
+        }
+    } else if did_index_http {
+        // First time
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "".into());
+        let patch = serde_json::json!({
+            "metadata": {"annotations": {
+                LAST_CHECK_ANN: now,
+                CHECK_COUNT_ANN: "1",
+                CHECK_INTERVAL_ANN: BASE_INTERVAL_SECS.to_string()
+            }}
+        });
+        let _ = api
+            .patch(&name, &pp, &kube::api::Patch::Merge(&patch))
+            .await;
+    }
+
+    Ok(Action::requeue(Duration::from_secs(next_interval as u64)))
 }
 
 pub fn error_policy(_idx: Arc<Index>, err: &ReconcileError, _ctx: Arc<Ctx>) -> Action {
-    error!(error = ?err, "index reconcile failed");
+    let summary = err.summary();
+    let allow = meili_shared::rate_limit::allow(&summary, std::time::Duration::from_secs(30));
+    if allow {
+        error!(summary=%summary, error=?err, "index reconcile failed");
+    } else {
+        tracing::debug!(summary=%summary, "suppressed duplicate error summary");
+    }
+    if summary.starts_with("timeout")
+        || summary.starts_with("dns")
+        || summary.starts_with("connect")
+    {
+        return Action::requeue(Duration::from_secs(10));
+    }
     Action::requeue(Duration::from_secs(60))
 }
 
@@ -219,8 +386,9 @@ async fn list_all_keys_http(
     endpoint: &str,
     master_key: &str,
 ) -> Result<Vec<KeyItem>, ReconcileError> {
+    use meili_shared::http_retry::retry3_quiet;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .build()
         .map_err(anyhow::Error::from)?;
     let mut out = Vec::new();
@@ -228,20 +396,25 @@ async fn list_all_keys_http(
     let limit = 1000usize;
     loop {
         let url = format!("{}/keys?offset={}&limit={}", endpoint, offset, limit);
-        let resp = client
-            .get(url)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", master_key),
-            )
-            .send()
-            .await
-            .map_err(anyhow::Error::from)?
-            .error_for_status()
-            .map_err(anyhow::Error::from)?
-            .json::<KeysPage>()
-            .await
-            .map_err(anyhow::Error::from)?;
+        let resp = retry3_quiet("list_keys_page", || {
+            let url = url.clone();
+            let client = client.clone();
+            let master_key = master_key.to_string();
+            async move {
+                let page = client
+                    .get(url)
+                    .header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {}", master_key),
+                    )
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let parsed = page.json::<KeysPage>().await?;
+                Ok(parsed)
+            }
+        })
+    .await?;
         offset += resp.results.len();
         out.extend(resp.results);
         if offset >= resp.total {
@@ -249,6 +422,46 @@ async fn list_all_keys_http(
         }
     }
     Ok(out)
+}
+
+async fn index_exists_http(
+    endpoint: &str,
+    master_key: &str,
+    uid: &str,
+) -> Result<bool, ReconcileError> {
+    use meili_shared::http_retry::retry3_quiet;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(anyhow::Error::from)?;
+    let url = format!("{}/indexes/{}", endpoint, uid);
+    let resp = retry3_quiet("index_exists", || {
+        let client = client.clone();
+        let url = url.clone();
+        let master_key = master_key.to_string();
+        async move {
+            let r = client
+                .get(url)
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {}", master_key),
+                )
+                .send()
+                .await?;
+            Ok(r)
+        }
+    })
+    .await?;
+    if resp.status().is_success() {
+        return Ok(true);
+    }
+    if resp.status().as_u16() == 404 {
+        return Ok(false);
+    }
+    Err(ReconcileError::Anyhow(anyhow::anyhow!(
+        "unexpected status checking index existence: {}",
+        resp.status()
+    )))
 }
 
 fn eq_unordered<T: Eq + std::hash::Hash + Clone>(a: &[T], b: &[T]) -> bool {

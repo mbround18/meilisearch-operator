@@ -15,6 +15,7 @@ Kubernetes operator (kube-rs, edition 2024) that manages Meilisearch clusters an
 - Admin key adoption for Index: reuses pre-existing admin keys when found.
 - Fast teardown: deleting a Server force-cleans related Keys/Indexes CRs without Meili calls.
 - Minimal, static container: MUSL-linked binary on distroless:static.
+- Optional signed webhooks on resource ready events.
 
 ## Quick start
 
@@ -86,6 +87,36 @@ docker run --rm -e OPERATOR_NAMESPACE=meilisearch-operator \
 - Index (v1alpha1): server_ref, uid, primary_key?, delete_on_finalize (false), admin_key?
 - Key (v1alpha1): server_ref, name?, description?, actions[], indexes[], expires_at?, secret_namespace, secret_name
 - Policy (v1alpha1): reserved for future use
+
+### Webhook notifications
+
+Each CRD supports an optional `spec.notifications` block:
+
+```yaml
+notifications:
+  webhook_url: https://example.com/meili-events
+  secret_ref:
+    name: meili-webhook-secret
+    namespace: meilisearch-testing   # optional; defaults to CR namespace
+    key: hmacKey                     # optional; defaults to hmacKey
+  events: ["ready"]                 # optional; empty => all
+  timeout_seconds: 5                 # optional; default 5
+```
+
+If `secret_ref` is provided, requests include `X-Meili-Operator-Signature: sha256=<hex>` where `<hex>` is HMAC-SHA256 of the JSON body using the secret value. Body shape:
+
+```json
+{
+  "event": "ready",
+  "resource": "my-index",
+  "namespace": "meilisearch-testing",
+  "payload": {"index": "movies", "ready": true, "serverRef": "meili-a"},
+  "timestamp": "2025-11-09T12:34:56Z"
+}
+```
+
+Events currently emitted: `ready` (resource becomes Ready). Future events may include status transitions or migration phases.
+
 
 Generate CRDs:
 

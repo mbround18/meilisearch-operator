@@ -32,6 +32,18 @@ spec:
               image:
                 nullable: true
                 type: string
+              imagePullSecrets:
+                items:
+                  description: LocalObjectReference contains enough information to let you locate the referenced object inside the same namespace.
+                  properties:
+                    name:
+                      description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                      type: string
+                  required:
+                  - name
+                  type: object
+                nullable: true
+                type: array
               incompatiblePolicy:
                 default: fail
                 enum:
@@ -44,6 +56,9 @@ spec:
                 maximum: 65535.0
                 minimum: 0.0
                 type: integer
+              pullPolicy:
+                nullable: true
+                type: string
               replicas:
                 default: 1
                 format: int32

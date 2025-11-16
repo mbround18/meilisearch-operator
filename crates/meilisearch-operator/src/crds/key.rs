@@ -28,6 +28,9 @@ pub struct KeySpec {
     /// Where to store the created key secret
     pub secret_namespace: String,
     pub secret_name: String,
+    /// Optional webhook notifications configuration
+    #[serde(default)]
+    pub notifications: Option<NotificationsSpec>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, JsonSchema)]
@@ -36,4 +39,23 @@ pub struct KeyStatus {
     pub uid: Option<String>,
     pub ready: bool,
     pub message: Option<String>,
+    pub last_event_ts: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, JsonSchema)]
+pub struct NotificationsSpec {
+    pub webhook_url: String,
+    pub secret_ref: Option<SecretRef>,
+    pub events: Option<Vec<String>>, // e.g. ["ready", "created"]
+    #[serde(default = "default_webhook_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_webhook_timeout() -> u64 { 5 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, JsonSchema)]
+pub struct SecretRef {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub key: Option<String>,
 }

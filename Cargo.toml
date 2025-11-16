@@ -14,3 +14,4 @@ resolver = "2"
 edition = "2024"
 authors = ["Meili Operator Authors"]
 license = "Apache-2.0"
+rust-version = "1.90"

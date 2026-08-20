@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.19
 # Multi-stage build using cargo-chef for optimal dependency caching and a small final image
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.98
 ARG TARGET_TRIPLE=x86_64-unknown-linux-musl
 
 # Base with Rust toolchain and cargo-chef installed

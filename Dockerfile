@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.19
+# syntax=docker/dockerfile:1.27
 # Multi-stage build using cargo-chef for optimal dependency caching and a small final image
 
 ARG RUST_VERSION=1.91

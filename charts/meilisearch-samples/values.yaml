@@ -7,7 +7,7 @@ podAnnotations: {}
 
 server:
   name: meili-a
-  image: getmeili/meilisearch:v1.24.0
+  image: getmeili/meilisearch:v1.53.2
   pullPolicy: Always
   imagePullSecrets: []
   replicas: 1
